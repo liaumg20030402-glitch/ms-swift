@@ -89,7 +89,7 @@ if self.sequence_parallel and self.tensor_model_parallel_size <= 1:
 即 **TP=1 时 SP 自动关掉**。
 
 ### `--micro_batch_size 1` / `--global_batch_size 144`
-- `micro_batch_size`：单卡单次 forward 的样本数
+- `micro_batch_size`：单DP组单次 forward 的样本数
 - `global_batch_size`：一个 optimizer step 处理的总样本数
 - 二者关系（隐含 DP 与梯度累积）：
   ```
