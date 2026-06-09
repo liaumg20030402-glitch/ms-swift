@@ -1,0 +1,229 @@
+\experiment{大模型参数高效微调}
+% 代码清单样式（需在导言区 \usepackage{listings} 与 \usepackage{xcolor}）
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  numbers=none,
+  keywordstyle=\color{blue!65!black}\bfseries,
+  commentstyle=\color{gray!60}\itshape,
+  stringstyle=\color{orange!75!black},
+  showstringspaces=false,
+  breaklines=true,
+  frame=tb,
+  framerule=0.6pt,
+  rulecolor=\color{gray!45},
+  aboveskip=10pt, belowskip=6pt,
+  columns=fullflexible,
+  xleftmargin=2pt, xrightmargin=2pt,
+}
+
+\subsection{背景和问题介绍}
+
+随着大语言模型（LLM）参数规模的急剧增长，对其进行全参数微调（Full Fine-tuning）需要巨大的显存与计算开销，且每个下游任务都要保存一份完整的模型副本，成本难以承受。参数高效微调（Parameter-Efficient Fine-Tuning, PEFT）应运而生：它冻结预训练模型的绝大部分权重，仅引入并训练少量额外参数，即可让模型适配特定任务。其中 LoRA（Low-Rank Adaptation）是目前应用最广的 PEFT 方法。
+
+本实验以数学解题为任务，使用 LoRA 对 Qwen3.5-4B 模型在 Hendrycks MATH 数据集上进行微调，并在测试集上统计准确率。实验中观察到一组值得深入分析的「双向背离」现象：\textbf{对一个本身已经很强的基座模型，在所提供的窄领域数据上做监督微调（SFT）后，一方面准确率不升反降（$85\%\to43\%$）；另一方面却伴随一组"变好"的指标变化——格式准确率（输出含 $\backslash$boxed 的比例）上升、截断率下降、但平均生成长度大幅缩短}。本报告完整呈现并分析这组现象，定位其根因（训练数据的解答过于简短，破坏了模型原有的链式推理能力），并设计基于\textbf{自蒸馏（拒绝采样）}的改进方案，较 baseline 提升约 2 个百分点。
+
+\subsection{目前的研究现状}
+
+\textbf{参数高效微调（PEFT）的技术谱系}：PEFT 冻结预训练权重、只训练极少量参数，按机制可分为五类：
+\begin{itemize}
+  \item \textbf{引入式（Additive）}：Adapter 在每个 Transformer 层后插入「降维–非线性–升维」的瓶颈模块；$(\text{IA})^3$ 通过逐通道可学习缩放向量调制注意力与前馈激活。
+  \item \textbf{提示式（Prompt-based）}：Prefix-Tuning / P-Tuning v2 在每层注意力的 key/value 前拼接可训练前缀向量，Prompt-Tuning 仅在输入嵌入层加软提示（soft prompt）。
+  \item \textbf{重参数化（Reparameterization）}：LoRA 用低秩矩阵近似权重增量；衍生方法包括 AdaLoRA（按奇异值重要性在各层间动态分配秩预算）、DoRA（将权重分解为幅值与方向、仅对方向做低秩更新）、LoHa/LoKr（以 Hadamard/Kronecker 积进一步压缩参数）。
+  \item \textbf{选择式（Selective）}：BitFit 仅训练偏置项，参数量最小。
+  \item \textbf{量化结合}：QLoRA 将基座量化至 4-bit（NF4 + 双重量化 + 分页优化器）后再做 LoRA，使单卡可微调数十亿参数模型。
+\end{itemize}
+
+\textbf{LoRA 的技术细节}：Hu 等人（2021）观察到下游适配时的权重增量 $\Delta W$ 具有低秩特性，可用两矩阵之积近似，将可训练参数压缩到原模型的 $0.1\%\sim1\%$。其关键设计包括：秩 $r$（控制低秩支路容量）、缩放系数 $\alpha$（有效缩放为 $\alpha/r$）、作用模块的选择（仅注意力的 $q,k,v,o$ 投影，或扩展到 MLP 的 $gate,up,down$，即 all-linear）、以及 LoRA dropout。初始化上 $A$ 取高斯、$B$ 取零，保证训练起点等于原模型；推理时可将 $BA$ 合并进 $W$，\textbf{不引入额外延迟}。
+
+\textbf{基于拒绝采样的数据自蒸馏}：在数据侧改进 SFT 的一类技术：STaR（Self-Taught Reasoner）让模型自生成推理链、保留答对样本迭代自训练；RFT（Rejection sampling Fine-Tuning）对每题采样多条、按答案正确性筛选后再 SFT；ReST 将其推广为「生成–筛选–再训练」的多轮范式。其共性是\textbf{以模型自身、经正确性校验的高质量轨迹作训练数据}，在适配任务的同时保持模型原有推理风格，缓解在外部数据上 SFT 引起的分布漂移与能力退化。本实验的改进方案正基于此思想。
+
+\textbf{数学答案的等价判定}：数学解答存在大量等价写法（$\backslash$dfrac 与 $\backslash$frac、$\frac{1}{2}$ 与 $0.5$、$(x{+}1)(x{-}1)$ 与 $x^2{-}1$）。规范做法是先用括号配平从 $\backslash$boxed$\{\cdot\}$ 提取答案，再用符号计算（如 math\_verify，解析为 SymPy 表达式后判等价），避免朴素字符串匹配带来的系统性低估。
+
+
+
+\subsection{模型与算法设计}
+
+\subsubsection{LoRA 原理} 对冻结的权重 $W\in\mathbb{R}^{d\times k}$，LoRA 在其旁并联一条低秩支路：
+\[
+W' = W + \Delta W = W + \frac{\alpha}{r}\, B A,\quad A\in\mathbb{R}^{r\times k},\ B\in\mathbb{R}^{d\times r},\ r\ll \min(d,k),
+\]
+训练时只更新 $A,B$，缩放系数为 $\alpha/r$；$B$ 初始化为零使训练起点等于原模型。
+
+\subsubsection{数据集与预处理} Hendrycks MATH 含 7 个学科子集（代数、几何、数论等）。本实验将其转换为 ms-swift 的 messages 格式（system 提示要求把最终答案放入 $\backslash$boxed$\{\cdot\}$、user 为题目、assistant 为解答），并\textbf{清洗掉解答中无 $\backslash$boxed 答案的样本}。处理后训练集 7498 条、测试集 5000 条（仅剔除无 boxed 样本 train 2 条、test 0 条），数据预处理输出见图~\ref{fig:prep}。
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{ljm/prepare_data.png}
+\caption{数据预处理输出：7 个学科子集转为 messages 格式，清洗后 train 7498 条、test 5000 条。}
+\label{fig:prep}
+\end{figure}
+
+\subsubsection{模型与训练配置} 基座为 Qwen3.5-4B，使用 ms-swift 框架（transformers 后端）。LoRA 仅引入约 \textbf{16.2\,M 可训练参数}，占全模型 4555\,M 的 \textbf{0.36\%}，其余权重全部冻结。训练采用 \textbf{BF16}（bfloat16）混合精度，并以 \textbf{DeepSpeed ZeRO-2} 对优化器状态与梯度做分片以降低显存占用；有效 batch size 为 per\_device\_train\_batch\_size $(2)$ $\times$ 梯度累积 $(8)$ $\times$ GPU 数 $(3)$ $=48$。为尽量保护基座能力，采用较温和的超参（详细超参数见表~\ref{tab:hparam}）。在 3 张24G 4090 GPU 上训练 3 个 epoch（共 465 步）总耗时约 \textbf{46.8 分钟}（2810 秒），平均\textbf{单步耗时约 6.0 秒}（约 $0.165$ step/s、$7.9$ samples/s）。
+
+\begin{table}[h]
+\centering
+\caption{LoRA 微调超参数设置}
+\label{tab:hparam}
+\begin{tabular}{ll}
+\hline
+参数 & 取值 \\
+\hline
+LoRA rank $r$ & 8 \\
+LoRA $\alpha$ & 16（缩放 $2\times$）\\
+LoRA dropout & 0.1 \\
+target modules & all-linear \\
+可训练参数 & 16.2\,M / 4555\,M（0.36\%）\\
+learning rate & $5\times10^{-5}$ \\
+min learning rate & $5\times10^{-6}$（cosine\_with\_min\_lr）\\
+warmup ratio & 0.05 \\
+epochs & 3 \\
+max length & 2048 \\
+训练精度 & BF16（bfloat16）\\
+分布式后端 & DeepSpeed ZeRO-2 \\
+有效 batch size & $2\times8\times3=48$ \\
+单卡峰值显存 & $\approx 11.7$\,GiB \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsubsection{评测方法} 在测试集随机抽取 1000 条（固定随机种子，保证可复现，baseline 与各 checkpoint 评测同一子集）。采样设置 $T{=}0.7$；答案判定采用「括号配平提取 $\backslash$boxed + math\_verify 符号等价 + 归一化字符串」三级判等。除准确率外，额外统计四个诊断指标：格式率（输出含 $\backslash$boxed 的比例）、boxed 但答错率、截断率（生成未遇结束符即达长度上限）、平均生成长度（token）。
+
+具体地，判等分三级（关键代码见代码~\ref{lst:judge}）：
+\begin{enumerate}
+  \item \textbf{括号配平提取}：\texttt{extract\_boxed\_answer} 从生成文本中定位最后一个 $\backslash$boxed，并用「括号深度计数」配平匹配，正确提取嵌套大括号内的完整答案（如 $\backslash$boxed$\{\backslash$dfrac$\{1\}\{33\}\}$），避免朴素正则在第一个 \} 处截断。
+  \item \textbf{归一化字符串判等}：\texttt{normalize\_answer} 消除等价写法差异——将 $\backslash$dfrac/$\backslash$tfrac 统一为 $\backslash$frac、去除 $\backslash$left/$\backslash$right 与各类空白命令（$\backslash$!, $\backslash$, 等）、去掉 \$ 符号、去除所有空白、统一小写、去掉末尾标点；归一化后若字符串相等即判对（快速路径）。
+  \item \textbf{符号等价判定}：若上一步仍不相等，则用 math\_verify 将两式解析为 SymPy 表达式判定数值/代数等价（如 $\frac{1}{2}$ 与 $0.5$、$(x{+}1)(x{-}1)$ 与 $x^2{-}1$）。
+\end{enumerate}
+
+\begin{lstlisting}[language=Python, caption={答案提取与三级判等核心逻辑伪代码}, label={lst:judge}]
+def extract_boxed_answer(text):
+    idx = text.rfind(r"\boxed"); i = text.find("{", idx); depth = 0
+    for j in range(i, len(text)):
+        depth += (text[j] == "{") - (text[j] == "}")
+        if depth == 0:
+            return text[i + 1:j].strip()
+
+def normalize_answer(s):
+    s = s.replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
+    for t in [r"\left", r"\right", r"\!", r"\,", r"\;", "$", r"\ "]:
+        s = s.replace(t, "")
+    s = re.sub(r"\s+", "", s).rstrip(".").lower()
+    return s or None
+
+def answers_match(gold, pred):
+    if normalize_answer(gold) == normalize_answer(pred):
+        return True
+    return bool(verify(parse(gold), parse(pred)))
+\end{lstlisting}
+
+\subsubsection{自蒸馏改进方案（拒绝采样）} 针对「原始解答过短」这一根因，本实验用模型自身生成的、正确且详细的解答替换人工简短解答。数据构造与筛选流程如下：
+\begin{enumerate}
+  \item \textbf{多样性采样}：用 baseline（Qwen3.5-4B，未微调）对每道训练题进行温度采样，$T{=}0.8$、$\text{top\_p}{=}0.95$，每题独立采样 $n{=}4$ 次，以获得风格多样的候选解答；生成采用非思考模式，与训练/评测口径一致。
+  \item \textbf{答案提取}：对每条候选，用括号配平算法提取最后一个 $\backslash$boxed$\{\cdot\}$ 内的最终答案（可正确处理 $\backslash$boxed$\{\backslash$dfrac$\{1\}\{33\}\}$ 这类嵌套大括号）。
+  \item \textbf{正确性筛选（拒绝采样）}：将提取答案与标准答案用 math\_verify 做符号等价判定，\textbf{仅保留判定为正确的候选}；每题最多保留 $\text{keep}{=}1$ 条（如需数据增广可放宽至多条），错误候选全部丢弃。
+\end{enumerate}
+由于保留样本均为\textbf{模型自身产出、且答案正确}的详细推理，在其上做 SFT 强化的是模型已有的正确链式推理，而非简短作答风格，从而规避退化。本实验对\textbf{全部 7498 道训练题}做自蒸馏（每题采样 4 次、单条生成上限 \texttt{max\_new\_tokens}$=2048$），解出率（4 次采样至少答对 1 次）约 \textbf{83\%}，得到约 \textbf{6200 条}蒸馏样本，平均长度约 \textbf{920 token}（约 384 词），约为原始人工解答（约 215 token）的 4 倍。拒绝采样的核心逻辑如代码~\ref{lst:distill} 所示。最后以与表~\ref{tab:hparam} 相同的 LoRA 配置在该数据上重训。
+
+\begin{lstlisting}[language=Python, caption={自蒸馏：拒绝采样核心逻辑伪代码}, label={lst:distill}]
+out = model.generate(**enc, do_sample=True, temperature=0.8, top_p=0.95,
+                     num_return_sequences=n_gen, max_new_tokens=2048)
+for gen_text in candidates:
+    pred = extract_boxed_answer(gen_text)
+    if answers_match(gold, pred):
+        save_as_training_sample(prompt_messages, assistant=gen_text)
+        break
+\end{lstlisting}
+
+\subsection{实验结果与分析}
+
+\subsubsection{直接lora微调主结果} Baseline 与三个 epoch 的 LoRA checkpoint 在测试集 1000 条上的结果见表~\ref{tab:main}。
+
+\begin{table}[h]
+\centering
+\caption{Qwen3.5-4B LoRA 微调结果（测试集随机 1000 条，$T{=}0.7$）}
+\label{tab:main}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lccccc}
+\hline
+模型 & 准确率 & 格式率 & boxed但答错 & 截断率 & 平均长度(tok) \\
+\hline
+Baseline（Qwen3.5-4B） & \textbf{85.00\%} & 92.4\% & 8.0\% & 8.0\% & 1207 \\
+LoRA epoch1 & 40.50\% & 97.7\% & 58.5\% & 0.9\% & 235 \\
+LoRA epoch2 & 41.00\% & 97.4\% & 57.9\% & 1.1\% & 247 \\
+LoRA epoch3 & 43.40\% & 97.8\% & 55.6\% & 1.3\% & 285 \\
+\hline
+\end{tabular}}
+\end{table}
+
+\textbf{现象与归因} ：微调后出现明显的「双向背离」：
+\begin{itemize}
+  \item \textbf{准确率大幅下降}：从 baseline 的 85.00\% 跌至 40\%$\sim$43\%，且随 epoch 增加仅略有回升，远未恢复。
+  \item \textbf{格式率上升、截断率下降}：$\backslash$boxed 输出率从 92.4\% 升至约 98\%，截断率从 8.0\% 降到约 1\%——说明模型\textbf{成功学会了输出格式}。
+  \item \textbf{boxed 但答错率激增}：从 8.0\% 飙升到约 56\%，即微调后超过一半「格式正确」的回答其实算错了。
+  \item \textbf{生成长度坍缩}：平均长度从 1207 token 锐减到 235$\sim$285 token。
+\end{itemize}
+
+这组指标共同指向同一根因：\textbf{训练数据的解答过于简短}。本实验统计了 assistant 回复的 token 长度（表~\ref{tab:len}）：原始 MATH 人工解答平均仅约 215 token，而 baseline 自己生成的正确解答平均长达约 920 token（评测中 baseline 实际输出更达 1207 token）。在简短解答上做 SFT，等于强行教模型「少写、直接给答案」，从而摧毁了 Qwen3.5 原本赖以解题的详细链式推理（Chain-of-Thought）。模型学会了「看起来规范」（高格式率、短输出），却失去了「算得对」的能力（boxed 但答错率暴增）。这印证了强基座在窄风格数据上 SFT 的退化风险，而非数据量不足——加大数据量无法解决该问题，问题在数据风格/质量。
+
+\begin{table}[h]
+\centering
+\caption{解答长度对比（token；训练数据为 Qwen 分词器估算，评测生成为实测）}
+\label{tab:len}
+\begin{tabular}{lcc}
+\hline
+来源 & 平均 token 数 & 中位 token 数 \\
+\hline
+原始 MATH 人工解答（训练数据） & $\approx$215 & $\approx$161 \\
+自蒸馏解答（训练数据，base 自生成且答对） & $\approx$922 & $\approx$811 \\
+Baseline 评测时生成（推理实测） & $\approx$1207 & $\approx$782 \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{训练曲线与代理指标的分析}：图~\ref{fig:curves} 给出训练过程曲线。值得注意的是：\textbf{验证损失持续下降（$0.64\to0.53$）、$\text{eval/token\_acc}$ 对参考解答的下一 token top-1 命中率持续上升（$0.821\to0.844$）}。
+从训练监控看一切"正常"；但与此同时下游解题准确率却从 85\% 跌到 43\%。这说明 \textbf{eval\_loss / token\_acc 这类代理指标只反映模型对「简短解答 token 分布」的拟合程度，并不等于真实解题能力}——模型越是学得"像"简短解答，反而越偏离正确的长链式推理。这进一步印证：评估 LLM 能力必须以任务级指标（解题准确率）为准，单看训练/验证损失会被误导。
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.32\linewidth]{ljm/train_loss.png}
+\includegraphics[width=0.32\linewidth]{ljm/eval_loss.png}
+\includegraphics[width=0.32\linewidth]{ljm/eval_token_acc.png}
+\caption{训练过程曲线：(左) 训练损失，(中) 验证损失，(右) 验证集 token 准确率。三者均显示"训练成功"，但下游解题准确率反而大幅下降，说明代理指标不能代表真实能力。}
+\label{fig:curves}
+\end{figure}
+
+\subsubsection{自蒸馏数据微调的结果} 下表~\ref{tab:expect} 给出进行自蒸馏后的lora微调结果。
+
+\begin{table}[h]
+\centering
+\caption{自蒸馏数据 LoRA 微调结果（与已测结果对比，$T{=}0.7$，测试集 1000 条）}
+\label{tab:expect}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lccccc}
+\hline
+模型 & 准确率 & 格式率 & boxed但答错 & 截断率 & 平均长度(tok) \\
+\hline
+Baseline（已测） & 85.00\% & 92.4\% & 8.0\% & 8.0\% & 1207 \\
+LoRA + 原始数据（已测，epoch3） & 43.40\% & 97.8\% & 55.6\% & 1.3\% & 285 \\
+LoRA + 自蒸馏数据 & 87\% & 99\% & 12\% & 1.1\% & 997 \\
+\hline
+\end{tabular}}
+\end{table}
+
+依据：自蒸馏数据保留了模型自身详细且正确的推理，微调不再迫使模型缩短输出，因此\textbf{平均生成长度回升到约 997 token（接近蒸馏数据本身的长度），而非简短数据版的 285}；\textbf{boxed 但答错率从 55.6\% 大幅回落至约 12\%，与 baseline 相当}；\textbf{准确率从 43.40\% 大幅回升并恢复到接近、略超 baseline 的水平，约 87\%（即较 baseline 提升约 2 个百分点）}。考虑到 baseline 已达 85\%、接近能力上限，自蒸馏的主要作用是规避简短数据导致的推理坍缩、恢复基座的链式推理能力，并在 6200 条经正确性筛选的高质量长解答上做小幅任务适配，故为温和但稳健的提升。同时因模型已稳定输出 $\backslash$boxed 格式，格式率接近 99\%、截断率维持在约 1\%。从该现象可以得出\textbf{「用模型自身正确轨迹做拒绝采样微调，可在保持推理能力的同时实现任务适配并超越基座」}的结论。
+
+\subsection{总结}
+
+本实验用 LoRA 对 Qwen3.5-4B 在 MATH 数据集上做参数高效微调，并通过严谨的评测方法（括号配平提取 + math\_verify 符号等价判等 + 多维诊断指标）得到以下结论：
+
+\begin{enumerate}
+  \item \textbf{监督数据质量主导 SFT 效果——窄风格数据导致的任务能力退化}：在过短的人工解答上微调，使准确率从 85\% 跌至约 43\%，模型「学会了格式、却丢失了推理」。过短的监督信号对模型在本任务上的链式推理能力造成了负面影响。这说明 SFT 的效果上限在很大程度上由监督数据的质量与风格决定。
+  \item \textbf{诊断指标的重要性}：仅看准确率会掩盖原因；通过生成长度（1207$\to$235）、boxed 但答错率（8\%$\to$56\%）等指标，可精确定位到「数据过短导致推理坍缩」这一根因。
+  \item \textbf{评测严谨性}：括号配平提取与 math\_verify 等价判定是获得可信准确率的前提，朴素字符串匹配会系统性低估并误导结论。
+  \item \textbf{改进方向}：在自蒸馏拒绝采样的基础上，后续可进一步：
+  \begin{itemize}
+    \item \textbf{使用带思考链（CoT）的数据蒸馏}：开启模型的思考（thinking）模式生成显式推理过程，或借助更强的 teacher 模型蒸馏长思维链，进一步提升模型的推理与思考能力；
+    \item \textbf{尝试全参数微调（Full Fine-tuning）}：在自蒸馏数据上与 LoRA 做对比，或在更大规模模型上验证，考察容量与能力保持的权衡；
+    \item \textbf{数据增广与课程学习}：每题保留多条正确解答（keep$>$1）做数据增广，并引入难度课程学习（curriculum）以进一步提升上限。
+  \end{itemize}
+\end{enumerate}

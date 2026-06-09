@@ -113,6 +113,7 @@ venv.bak/
 
 # custom
 *.pkl
+*.parquet
 *.pkl.json
 *.log.json
 *.whl
@@ -138,6 +139,8 @@ eval_outputs/
 vlmeval/
 my_model/
 /data
+data/
+infer_output/
 result/
 images
 /custom/
