@@ -259,7 +259,7 @@ def parse_args():
                    help="随机抽 N 条评测（固定种子，可复现），-1 表示全量")
     p.add_argument("--seed", type=int, default=42, help="随机抽样种子")
     p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--max-new-tokens", type=int, default=2048,
+    p.add_argument("--max-new-tokens", type=int, default=4096,
                    help="最大生成长度；太小会在写到 \\boxed 前被截断导致判错")
     p.add_argument("--temperature", type=float, default=0.7,
                    help="0=greedy（推荐，准确率可复现）；设 0.7 可对齐老师 notebook")
