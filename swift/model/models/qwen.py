@@ -6,25 +6,18 @@ import torch
 import torch.nn.functional as F
 from packaging import version
 from PIL import Image
-from transformers import AutoTokenizer, BitsAndBytesConfig, PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import (AutoConfig, AutoModel, AutoTokenizer, BitsAndBytesConfig, PretrainedConfig, PreTrainedModel,
+                          PreTrainedTokenizerBase)
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from transformers.models.auto.tokenization_auto import get_tokenizer_config
-
-try:
-    from transformers.utils.import_utils import is_flash_linear_attention_available
-except ImportError:
-
-    def is_flash_linear_attention_available():
-        return False
-
-
 from transformers.utils.versions import require_version
 from types import MethodType
 from typing import Optional, Tuple, Type, Union
 
+from swift.sequence_parallel import sequence_parallel
 from swift.template import TemplateType
-from swift.utils import (Processor, get_device_count, get_dist_setting, get_env_args, get_logger, is_deepspeed_enabled,
-                         to_device)
+from swift.utils import (Processor, get_cu_seqlens_from_position_ids, get_device_count, get_dist_setting, get_env_args,
+                         get_logger, is_deepspeed_enabled, safe_snapshot_download, to_device)
 from ..constant import LLMModelType, MLLMModelType, RMModelType
 from ..model_arch import ModelArch
 from ..model_meta import Model, ModelGroup, ModelMeta
@@ -35,19 +28,16 @@ from ..utils import AttnImpl, use_submodel_func
 logger = get_logger()
 dtype_mapping = {torch.float16: 'fp16', torch.bfloat16: 'bf16', torch.float32: 'fp32'}
 
-if is_flash_linear_attention_available():
-    try:
-        from fla.modules.convolution import causal_conv1d as _FLA_CAUSAL_CONV1D_FN
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _FLA_CHUNK_GATED_DELTA_RULE
-    except Exception:
-        _FLA_CAUSAL_CONV1D_FN = None
-        _FLA_CHUNK_GATED_DELTA_RULE = None
-else:
-    _FLA_CAUSAL_CONV1D_FN = None
-    _FLA_CHUNK_GATED_DELTA_RULE = None
+causal_conv1d = None
+chunk_gated_delta_rule = None
+try:
+    from transformers.utils.import_utils import is_flash_linear_attention_available
 
-_SP_LINEAR_KERNEL_IMPORT_ERROR = ('Qwen3.5 linear attention sequence parallel requires flash-linear-attention. '
-                                  'Install: https://github.com/fla-org/flash-linear-attention#installation')
+    if is_flash_linear_attention_available():
+        from fla.modules.convolution import causal_conv1d
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+except Exception:
+    pass
 
 
 class QwenLoader(ModelLoader):
@@ -1154,41 +1144,33 @@ register_model(
         tags=['vision', 'video']))
 
 
-def _sp_is_enabled(sequence_parallel_context) -> bool:
-    return bool(
-        sequence_parallel_context is not None and int(getattr(sequence_parallel_context, 'sp_world_size', 1) or 1) > 1)
-
-
-def _get_sp_rank(sequence_parallel_context) -> int:
-    return int(getattr(sequence_parallel_context, 'sp_rank', 0) or 0)
-
-
-def seq_to_head_shard(input: torch.Tensor, sequence_parallel_context) -> torch.Tensor:
-    if not _sp_is_enabled(sequence_parallel_context):
+def seq_to_head_shard(input: torch.Tensor) -> torch.Tensor:
+    if not sequence_parallel.enabled():
         return input
     from swift.sequence_parallel.ulysses import _SeqAllToAll
-    return _SeqAllToAll.apply(sequence_parallel_context.sp_group, input, 2, 1)
+    return _SeqAllToAll.apply(sequence_parallel.sp_group, input, 2, 1)
 
 
-def head_to_seq_shard(input: torch.Tensor, sequence_parallel_context) -> torch.Tensor:
-    if not _sp_is_enabled(sequence_parallel_context):
+def head_to_seq_shard(input: torch.Tensor) -> torch.Tensor:
+    if not sequence_parallel.enabled():
         return input
     from swift.sequence_parallel.ulysses import _SeqAllToAll
-    return _SeqAllToAll.apply(sequence_parallel_context.sp_group, input, 1, 2)
+    return _SeqAllToAll.apply(sequence_parallel.sp_group, input, 1, 2)
 
 
-def _get_local_padding_mask(attention_mask: torch.Tensor, local_seq_len: int, sequence_parallel_context):
-    if attention_mask.shape[1] == local_seq_len or not _sp_is_enabled(sequence_parallel_context):
+def _get_local_padding_mask(attention_mask: torch.Tensor, local_seq_len: int):
+    if not sequence_parallel.enabled() or attention_mask.shape[1] == local_seq_len:
         return attention_mask
-    real_position_ids = getattr(sequence_parallel_context, 'real_position_ids', None)
-    return sequence_parallel_context.split(attention_mask, dim=1, position_ids=real_position_ids)
+    real_position_ids = getattr(sequence_parallel, 'real_position_ids', None)
+    return sequence_parallel.split(attention_mask, dim=1, position_ids=real_position_ids)
 
 
 def _ensure_linear_attention_kernels(mod: torch.nn.Module) -> None:
-    mod.causal_conv1d_fn = _FLA_CAUSAL_CONV1D_FN
-    mod.chunk_gated_delta_rule = getattr(mod, 'chunk_gated_delta_rule', None) or _FLA_CHUNK_GATED_DELTA_RULE
-    if mod.chunk_gated_delta_rule is None or mod.causal_conv1d_fn is None:
-        raise ImportError(_SP_LINEAR_KERNEL_IMPORT_ERROR)
+    mod._swift_fla_causal_conv1d_fn = causal_conv1d
+    mod.chunk_gated_delta_rule = getattr(mod, 'chunk_gated_delta_rule', None) or chunk_gated_delta_rule
+    if mod.chunk_gated_delta_rule is None or mod._swift_fla_causal_conv1d_fn is None:
+        raise ImportError('Qwen3.5 linear attention padding free/sequence parallel requires flash-linear-attention. '
+                          'Install: https://github.com/fla-org/flash-linear-attention#installation')
 
 
 def _get_local_conv_weights(mod: torch.nn.Module, *, sp_rank: int, local_num_k_heads: int, local_num_v_heads: int):
@@ -1217,14 +1199,12 @@ def _get_local_conv_weights(mod: torch.nn.Module, *, sp_rank: int, local_num_k_h
     return conv_weight, conv_bias
 
 
-def _get_qwen3_5_cu_seqlens_q(sequence_parallel_context):
-    if not bool(getattr(sequence_parallel_context, 'padding_free', False)):
+def _get_qwen3_5_cu_seqlens_q():
+    if not getattr(sequence_parallel, 'padding_free', False):
         return None
-    real_position_ids = getattr(sequence_parallel_context, 'real_position_ids', None)
+    real_position_ids = getattr(sequence_parallel, 'real_position_ids', None)
     if torch.is_tensor(real_position_ids) and real_position_ids.ndim == 2 and real_position_ids.shape[0] == 1:
-        from swift.utils import get_cu_seqlens_from_position_ids
-        padded_position_ids = sequence_parallel_context.pad(
-            real_position_ids, padding_value=-1, position_ids=real_position_ids)
+        padded_position_ids = sequence_parallel.pad(real_position_ids, padding_value=-1, position_ids=real_position_ids)
         return get_cu_seqlens_from_position_ids(padded_position_ids)
     return None
 
@@ -1236,15 +1216,14 @@ def _run_qwen3_5_gated_delta_net_sequence_parallel_forward(
     cache_params=None,
     cache_position=None,
     attention_mask: Optional[torch.Tensor] = None,
-    sequence_parallel_context=None,
+    **kwargs,
 ) -> torch.Tensor:
     _ensure_linear_attention_kernels(mod)
     from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
 
     local_attention_mask = attention_mask
     if torch.is_tensor(attention_mask) and attention_mask.dim() == 2:
-        local_attention_mask = _get_local_padding_mask(attention_mask, hidden_states.shape[1],
-                                                       sequence_parallel_context)
+        local_attention_mask = _get_local_padding_mask(attention_mask, hidden_states.shape[1])
     hidden_states = apply_mask_to_padding_states(hidden_states, local_attention_mask)
     batch_size, seq_len, _ = hidden_states.shape
 
@@ -1260,9 +1239,9 @@ def _run_qwen3_5_gated_delta_net_sequence_parallel_forward(
     b = mod.in_proj_b(hidden_states)
     a = mod.in_proj_a(hidden_states)
 
-    sp_enabled = _sp_is_enabled(sequence_parallel_context)
+    sp_enabled = sequence_parallel.enabled()
     if sp_enabled:
-        sp_world_size = int(sequence_parallel_context.sp_world_size)
+        sp_world_size = int(sequence_parallel.sp_world_size)
         if mod.num_k_heads % sp_world_size != 0 or mod.num_v_heads % sp_world_size != 0:
             raise RuntimeError(
                 'Qwen3.5 linear attention sequence parallel requires sp_world_size to divide both '
@@ -1273,11 +1252,11 @@ def _run_qwen3_5_gated_delta_net_sequence_parallel_forward(
         q_proj = q_proj.reshape(batch_size, seq_len, mod.num_k_heads, mod.head_k_dim)
         k_proj = k_proj.reshape(batch_size, seq_len, mod.num_k_heads, mod.head_k_dim)
         v_proj = v_proj.reshape(batch_size, seq_len, mod.num_v_heads, mod.head_v_dim)
-        q_proj = seq_to_head_shard(q_proj, sequence_parallel_context)
-        k_proj = seq_to_head_shard(k_proj, sequence_parallel_context)
-        v_proj = seq_to_head_shard(v_proj, sequence_parallel_context)
-        b = seq_to_head_shard(b.reshape(batch_size, seq_len, mod.num_v_heads, 1), sequence_parallel_context).squeeze(-1)
-        a = seq_to_head_shard(a.reshape(batch_size, seq_len, mod.num_v_heads, 1), sequence_parallel_context).squeeze(-1)
+        q_proj = seq_to_head_shard(q_proj)
+        k_proj = seq_to_head_shard(k_proj)
+        v_proj = seq_to_head_shard(v_proj)
+        b = seq_to_head_shard(b.reshape(batch_size, seq_len, mod.num_v_heads, 1)).squeeze(-1)
+        a = seq_to_head_shard(a.reshape(batch_size, seq_len, mod.num_v_heads, 1)).squeeze(-1)
         seq_after_shard = q_proj.shape[1]
         mixed_qkv = torch.cat((
             q_proj.reshape(batch_size, seq_after_shard, local_num_k_heads * mod.head_k_dim),
@@ -1285,7 +1264,7 @@ def _run_qwen3_5_gated_delta_net_sequence_parallel_forward(
             v_proj.reshape(batch_size, seq_after_shard, local_num_v_heads * mod.head_v_dim),
         ),
                               dim=-1)
-        sp_rank = _get_sp_rank(sequence_parallel_context)
+        sp_rank = sequence_parallel.sp_rank
         conv_weight, conv_bias = _get_local_conv_weights(
             mod, sp_rank=sp_rank, local_num_k_heads=local_num_k_heads, local_num_v_heads=local_num_v_heads)
     else:
@@ -1297,23 +1276,20 @@ def _run_qwen3_5_gated_delta_net_sequence_parallel_forward(
         conv_weight = mod.conv1d.weight.squeeze(1)
         conv_bias = getattr(mod.conv1d, 'bias', None)
 
-    packed_cu_seqlens = None
-    if sequence_parallel_context is not None:
-        packed_cu_seqlens = _get_qwen3_5_cu_seqlens_q(sequence_parallel_context)
-        if packed_cu_seqlens is not None:
-            packed_cu_seqlens = packed_cu_seqlens.to(dtype=torch.int32, device=mixed_qkv.device)
+    if sp_enabled:
+        cu_seqlens = _get_qwen3_5_cu_seqlens_q()
+    else:
+        cu_seqlens = kwargs.get('cu_seq_lens_q')
 
     if cache_params is not None:
         cache_params.conv_states[mod.layer_idx] = F.pad(
             mixed_qkv.transpose(1, 2).contiguous(), (mod.conv_kernel_size - mixed_qkv.shape[1], 0))
-    mixed_qkv, _ = mod.causal_conv1d_fn(
+    mixed_qkv, _ = mod._swift_fla_causal_conv1d_fn(
         x=mixed_qkv,
         weight=conv_weight,
         bias=conv_bias,
         activation=mod.activation,
-        seq_idx=None,
-        backend='triton',
-        cu_seqlens=packed_cu_seqlens,
+        cu_seqlens=cu_seqlens,
     )
     if mixed_qkv.dim() == 2:
         mixed_qkv = mixed_qkv.unsqueeze(0)
@@ -1343,15 +1319,15 @@ def _run_qwen3_5_gated_delta_net_sequence_parallel_forward(
         'output_final_state': cache_params is not None,
         'use_qk_l2norm_in_kernel': True,
     }
-    if packed_cu_seqlens is not None:
-        chunk_kwargs['cu_seqlens'] = packed_cu_seqlens
+    if cu_seqlens is not None:
+        chunk_kwargs['cu_seqlens'] = cu_seqlens
     core_attn_out, last_recurrent_state = mod.chunk_gated_delta_rule(query, key, value, **chunk_kwargs)
 
     if cache_params is not None:
         cache_params.recurrent_states[mod.layer_idx] = last_recurrent_state
 
     if sp_enabled:
-        core_attn_out = head_to_seq_shard(core_attn_out, sequence_parallel_context)
+        core_attn_out = head_to_seq_shard(core_attn_out)
     core_attn_out = mod.norm(core_attn_out.reshape(-1, mod.head_v_dim), z.reshape(-1, mod.head_v_dim))
     core_attn_out = core_attn_out.reshape(batch_size, seq_len, local_value_dim if not sp_enabled else mod.value_dim)
     return mod.out_proj(core_attn_out)
@@ -1375,33 +1351,33 @@ def _patch_qwen3_5_linear_attention_sequence_parallel() -> None:
         cache_params=None,
         cache_position=None,
         attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
     ):
-        from swift.sequence_parallel import sequence_parallel as sequence_parallel_context
-
-        if not _sp_is_enabled(sequence_parallel_context):
+        if not sequence_parallel.enabled() and 'cu_seq_lens_q' not in kwargs:
             kwargs = {}
             if 'cache_position' in parameters:
                 kwargs['cache_position'] = cache_position
             return origin_forward(
                 mod, hidden_states, cache_params=cache_params, attention_mask=attention_mask, **kwargs)
 
-        if int(getattr(sequence_parallel_context, 'rp_world_size', 1) or 1) > 1:
-            requested_sp_size = int(getattr(sequence_parallel_context, 'world_size', 1) or 1)
-            suggested_sp_size = int(getattr(sequence_parallel_context, 'sp_world_size', 1) or 1)
+        if int(sequence_parallel.rp_world_size or 1) > 1:
+            requested_sp_size = int(sequence_parallel.world_size or 1)
+            suggested_sp_size = int(sequence_parallel.sp_world_size or 1)
             raise NotImplementedError(
                 'Qwen3.5 linear attention sequence parallel does not support derived ring attention '
                 f'(sequence_parallel_size={requested_sp_size}, '
-                f'sp_world_size={getattr(sequence_parallel_context, "sp_world_size", None)}, '
-                f'rp_world_size={getattr(sequence_parallel_context, "rp_world_size", None)}). '
+                f'sp_world_size={sequence_parallel.sp_world_size}, '
+                f'rp_world_size={sequence_parallel.rp_world_size}). '
                 f'Please reduce --sequence_parallel_size to {suggested_sp_size} so that rp_world_size becomes 1.')
 
+        # padding_free/packing or sp will all go through here
         return _run_qwen3_5_gated_delta_net_sequence_parallel_forward(
             mod,
             hidden_states,
             cache_params=cache_params,
             cache_position=cache_position,
             attention_mask=attention_mask,
-            sequence_parallel_context=sequence_parallel_context,
+            **kwargs,
         )
 
     Qwen3_5GatedDeltaNet.forward = sp_linear_forward
@@ -1498,9 +1474,7 @@ class Qwen2_5OmniLoader(ModelLoader):
             compat_qwen_vl_utils(image_patch_size=14)
 
     def get_config(self, model_dir):
-        from transformers import Qwen2_5OmniConfig
         self._check_qwen_omni_utils()
-        self.auto_config_cls = Qwen2_5OmniConfig
         enable_audio_output = get_env_args('ENABLE_AUDIO_OUTPUT', bool, None)
         config = super().get_config(model_dir)
         if enable_audio_output is not None:
@@ -1707,9 +1681,7 @@ class Qwen3OmniLoader(ModelLoader):
         compat_qwen_vl_utils(image_patch_size=16)
 
     def get_config(self, model_dir: str):
-        from transformers import Qwen3OmniMoeConfig
         self._check_qwen_omni_utils()
-        self.auto_config_cls = Qwen3OmniMoeConfig
         config = super().get_config(model_dir)
         enable_audio_output = get_env_args('ENABLE_AUDIO_OUTPUT', bool, None)
         if enable_audio_output is not None:
@@ -1764,7 +1736,6 @@ class Qwen3ASRLoader(ModelLoader):
         return super().get_config(model_dir)
 
     def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
-        from transformers import AutoModel
         self.auto_model_cls = self.auto_model_cls or AutoModel
         model = super().get_model(model_dir, config, processor, model_kwargs)
         use_submodel_func(model, 'thinker')
@@ -1785,6 +1756,110 @@ register_model(
         architectures=['Qwen3ASRForConditionalGeneration'],
         requires=['qwen-asr', 'transformers==4.57.6'],
         tags=['audio'],
+    ))
+
+
+def _patch_qwen3_tts_forward(model):
+    """Patch model.forward to implement Qwen3-TTS dual-channel training logic."""
+
+    def tts_forward(self,
+                    input_ids=None,
+                    attention_mask=None,
+                    speaker_embedding=None,
+                    text_embedding_mask=None,
+                    codec_embedding_mask=None,
+                    codec_0_labels=None,
+                    codec_ids=None,
+                    codec_mask=None,
+                    **kwargs):
+
+        # Separate dual-channel input_ids
+        input_text_ids = input_ids[:, :, 0]
+        input_codec_ids = input_ids[:, :, 1]
+
+        # Build text and codec embeddings
+        input_text_embedding = self.talker.model.text_embedding(input_text_ids) * text_embedding_mask
+        input_codec_embedding = self.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+        # Inject speaker embedding at position 6
+        input_codec_embedding[:, 6, :] = speaker_embedding
+
+        # Sum text and codec embeddings
+        input_embeddings = input_text_embedding + input_codec_embedding
+
+        # Add sub-talker codec embeddings (layers 1-15)
+        for i in range(1, 16):
+            codec_i_embedding = self.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
+            codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
+            input_embeddings = input_embeddings + codec_i_embedding
+
+        # Forward through talker (shifted by 1 for autoregressive prediction)
+        outputs = self.talker(
+            inputs_embeds=input_embeddings[:, :-1, :],
+            attention_mask=attention_mask[:, :-1],
+            labels=codec_0_labels[:, 1:],
+            output_hidden_states=True,
+        )
+
+        # Compute sub_talker_loss from hidden states at codec positions
+        hidden_states = outputs.hidden_states[0][-1]
+        talker_hidden_states = hidden_states[codec_mask[:, :-1]]
+        talker_codec_ids = codec_ids[codec_mask]
+
+        _, sub_talker_loss = self.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+
+        # Attach sub_talker_loss to outputs for the custom loss function
+        outputs.sub_talker_loss = sub_talker_loss
+        return outputs
+
+    model.forward = MethodType(tts_forward, model)
+
+
+class Qwen3TTSLoader(ModelLoader):
+
+    def get_config(self, model_dir: str):
+        from qwen_tts.core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
+        from transformers import AutoProcessor
+        AutoConfig.register('qwen3_tts', Qwen3TTSConfig)
+        AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
+        AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor)
+
+        return super().get_config(model_dir)
+
+    def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
+        self.auto_model_cls = self.auto_model_cls or AutoModel
+        model = super().get_model(model_dir, config, processor, model_kwargs)
+        # Redirect gradient_checkpointing and get_input_embeddings to talker
+        use_submodel_func(model, 'talker', func_list=['get_input_embeddings', 'gradient_checkpointing_enable'])
+        if model.speaker_encoder is not None:
+            # Freeze speaker_encoder (only talker is trained)
+            for param in model.speaker_encoder.parameters():
+                param.requires_grad = False
+        # Patch forward for TTS dual-channel training
+        _patch_qwen3_tts_forward(model)
+        from qwen_tts import Qwen3TTSTokenizer
+        tokenizer_path = get_env_args('tts_tokenizer_path', str, 'Qwen/Qwen3-TTS-Tokenizer-12Hz')
+        tokenizer_path = safe_snapshot_download(tokenizer_path)
+        processor.tts_tokenizer = Qwen3TTSTokenizer.from_pretrained(tokenizer_path, device_map='cpu')
+        model.config = config
+        return model
+
+
+register_model(
+    ModelMeta(
+        MLLMModelType.qwen3_tts,
+        [
+            ModelGroup([
+                Model('Qwen/Qwen3-TTS-12Hz-1.7B-Base', 'Qwen/Qwen3-TTS-12Hz-1.7B-Base'),
+                Model('Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice', 'Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice'),
+                Model('Qwen/Qwen3-TTS-12Hz-0.6B-Base', 'Qwen/Qwen3-TTS-12Hz-0.6B-Base'),
+                Model('Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice', 'Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice'),
+            ], TemplateType.qwen3_tts)
+        ],
+        Qwen3TTSLoader,
+        model_arch=ModelArch.qwen3_tts,
+        architectures=['Qwen3TTSForConditionalGeneration'],
+        requires=['qwen-tts'],
+        tags=['audio', 'tts'],
     ))
 
 

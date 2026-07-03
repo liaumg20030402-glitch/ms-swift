@@ -1,6 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import inspect
 import torch
 import torch.distributed as dist
+import transformers
+from packaging import version
 from PIL import Image
 from transformers import PreTrainedModel
 from types import MethodType
@@ -12,6 +15,8 @@ from ..model_arch import ModelArch
 from ..model_meta import Model, ModelGroup, ModelMeta
 from ..patcher import patch_output_to_input_device
 from ..register import ModelLoader, SentenceTransformersLoader, register_model
+
+transformers_5_9 = version.parse(transformers.__version__) >= version.parse('5.9')
 
 
 class PaligemmaVisionLoader(ModelLoader):
@@ -204,9 +209,15 @@ register_model(
     ))
 
 
-def _patch_gemma4_forward(model, processor):
-    from transformers.models.gemma4.modeling_gemma4 import (Gemma4ModelOutputWithPast, create_causal_mask_mapping,
-                                                            create_masks_for_generate, torch_compilable_check)
+def _patch_gemma4_forward(model, processor, is_gemma4_unified: bool = False):
+    if is_gemma4_unified:
+        from transformers.models.gemma4_unified.modeling_gemma4_unified import \
+            Gemma4UnifiedModelOutputWithPast as Gemma4ModelOutputWithPast
+        from transformers.models.gemma4_unified.modeling_gemma4_unified import (create_masks_for_generate,
+                                                                                torch_compilable_check)
+    else:
+        from transformers.models.gemma4.modeling_gemma4 import (Gemma4ModelOutputWithPast, create_masks_for_generate,
+                                                                torch_compilable_check)
     if hasattr(model, 'origin_forward'):
         return
 
@@ -214,7 +225,7 @@ def _patch_gemma4_forward(model, processor):
         images = [Image.new('RGB', (32, 32), (0, 0, 0))]
         image_inputs = processor.image_processor(images=images, return_tensors='pt')
         image_inputs = to_device(image_inputs, inputs_embeds.device)
-        dummy_pixel = image_inputs['pixel_values'].to(model.vision_tower.dtype)
+        dummy_pixel = image_inputs['pixel_values'].to(model.dtype)
         dummy_pos_ids = image_inputs.get('image_position_ids')
         image_features = model.get_image_features(dummy_pixel, dummy_pos_ids, return_dict=True).pooler_output
         inputs_embeds = inputs_embeds + image_features.mean() * 0.
@@ -236,6 +247,7 @@ def _patch_gemma4_forward(model, processor):
         use_cache: bool | None = None,
         image_position_ids: torch.LongTensor | None = None,
         video_position_ids: torch.LongTensor | None = None,
+        per_layer_inputs: torch.Tensor | None = None,
         **kwargs,
     ) -> Gemma4ModelOutputWithPast:
         r"""
@@ -261,8 +273,9 @@ def _patch_gemma4_forward(model, processor):
             llm_input_ids[multimodal_mask] = self.config.text_config.pad_token_id
             inputs_embeds = self.get_input_embeddings()(llm_input_ids)
 
-        if self.config.get_text_config().hidden_size_per_layer_input:
+        if per_layer_inputs is None and self.config.get_text_config().hidden_size_per_layer_input:
             pad_embedding = self.language_model.embed_tokens.weight[self.config.text_config.pad_token_id, :]
+            pad_embedding = pad_embedding.to(device=multimodal_mask.device)
             llm_inputs_embeds = torch.where(multimodal_mask[..., None], pad_embedding.view(1, 1, -1), inputs_embeds)
             per_layer_inputs = self.language_model.get_per_layer_inputs(llm_input_ids, llm_inputs_embeds)
         else:
@@ -347,8 +360,11 @@ def _patch_gemma4_forward(model, processor):
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
             position_ids = position_ids.unsqueeze(0)
 
+        bi_vision_attn = self.config.get_text_config().use_bidirectional_attention == 'vision'
         if not isinstance(causal_mask_mapping := attention_mask, dict):
-            if self.config.get_text_config().use_bidirectional_attention == 'vision':
+            if bi_vision_attn and not transformers_5_9:
+                from transformers.models.gemma4.modeling_gemma4 import create_causal_mask_mapping
+
                 # Larger Gemma 4 models use Gemma 3's bidirectional attention mask for vision inputs
                 causal_mask_mapping = create_causal_mask_mapping(
                     self.config,
@@ -359,14 +375,25 @@ def _patch_gemma4_forward(model, processor):
                     mm_token_type_ids=mm_token_type_ids,
                 )
             else:
-                # Smaller Gemma models use a conventional casual attention mask
-                causal_mask_mapping = create_masks_for_generate(
-                    self.config,
-                    inputs_embeds,
-                    attention_mask,
-                    past_key_values,
-                    position_ids,
-                )
+                mask_kwargs = {
+                    'config': self.config,
+                    'inputs_embeds': inputs_embeds,
+                    'attention_mask': attention_mask,
+                    'past_key_values': past_key_values,
+                    'position_ids': position_ids,
+                }
+                if bi_vision_attn:
+                    from transformers.models.gemma4.modeling_gemma4 import get_block_sequence_ids_for_mask
+                    block_sequence_ids = torch.full([*inputs_embeds.size()[:-1]], -1, device=inputs_embeds.device)
+                    if mm_token_type_ids is not None:
+                        kwargs = {
+                            'device': inputs_embeds.device
+                        } if 'device' in inspect.signature(get_block_sequence_ids_for_mask).parameters else {}
+                        block_sequence_ids = get_block_sequence_ids_for_mask(mm_token_type_ids, **kwargs)
+
+                    mask_kwargs['block_sequence_ids'] = block_sequence_ids
+
+                causal_mask_mapping = create_masks_for_generate(**mask_kwargs)
         kwargs.pop('return_dict', None)
         outputs = self.language_model(
             per_layer_inputs=per_layer_inputs,
@@ -424,5 +451,58 @@ register_model(
         Gemma4Loader,
         architectures=['Gemma4ForConditionalGeneration'],
         model_arch=ModelArch.gemma3n,
-        requires=['transformers>=4.53'],
+    ))
+
+
+class Gemma4UnifiedLoader(ModelLoader):
+
+    def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
+        from transformers import Gemma4UnifiedForConditionalGeneration
+        self.auto_model_cls = self.auto_model_cls or Gemma4UnifiedForConditionalGeneration
+        model = super().get_model(model_dir, config, processor, model_kwargs)
+        _patch_gemma4_forward(model.model, processor, is_gemma4_unified=True)
+        return model
+
+
+register_model(
+    ModelMeta(
+        MLLMModelType.gemma4_unified,
+        [
+            ModelGroup([
+                Model('google/gemma-4-12B', 'google/gemma-4-12B'),
+                Model('google/gemma-4-12B-it', 'google/gemma-4-12B-it'),
+            ],
+                       template=TemplateType.gemma4),
+        ],
+        Gemma4UnifiedLoader,
+        architectures=['Gemma4UnifiedForConditionalGeneration'],
+        model_arch=ModelArch.gemma4_unified,
+        requires=['transformers>=5.10.1'],
+    ))
+
+
+class DiffusionGemmaLoader(ModelLoader):
+
+    def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
+        from transformers import DiffusionGemmaForBlockDiffusion
+        self.auto_model_cls = self.auto_model_cls or DiffusionGemmaForBlockDiffusion
+        model = super().get_model(model_dir, config, processor, model_kwargs)
+        model.prepare_inputs_for_generation = None
+        model.config.use_cache = True
+        return model
+
+
+register_model(
+    ModelMeta(
+        MLLMModelType.diffusion_gemma,
+        [
+            ModelGroup([
+                Model('google/diffusiongemma-26B-A4B-it', 'google/diffusiongemma-26B-A4B-it'),
+            ],
+                       template=TemplateType.diffusion_gemma),
+        ],
+        DiffusionGemmaLoader,
+        architectures=['DiffusionGemmaForBlockDiffusion'],
+        model_arch=ModelArch.diffusion_gemma,
+        requires=['transformers>=5.11'],
     ))

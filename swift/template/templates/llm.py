@@ -347,7 +347,7 @@ class HyV3Template(Template):
         if self.reasoning_effort is None:
             self.reasoning_effort = 'high' if self.enable_thinking else 'no_think'
         self.enable_thinking = self.reasoning_effort != 'no_think'
-        self.chat_template_kwargs = {'reasoning_effort': self.reasoning_effort}
+        self.chat_template_kwargs['reasoning_effort'] = self.reasoning_effort
 
     def _get_enable_thinking(self, inputs=None):
         reasoning_effort = None if inputs is None else inputs.chat_template_kwargs.get('reasoning_effort')
@@ -456,6 +456,17 @@ register_template(
     ))
 
 register_template(
+    TemplateMeta(
+        LLMTemplateType.ring2_5,
+        prefix=[],
+        system_prefix=['<role>SYSTEM</role>\n{{SYSTEM}}\n\n'],
+        prompt=['<role>HUMAN</role>\n{{QUERY}}<|role_end|>\n\n<role>ASSISTANT</role>\n'],
+        chat_sep=['<|role_end|>\n\n'],
+        suffix=['<|role_end|>\n\n'],
+        is_thinking=True,
+    ))
+
+register_template(
     QwenTemplateMeta(
         LLMTemplateType.iquestcoder,
         default_system='You are LoopCoder, a helpful assistant developed by IQuest.',
@@ -482,8 +493,6 @@ class YoutuLLMTemplate(Template):
                     break
 
     def _remove_history_thinking(self, inputs) -> None:
-        if self.is_training and self.loss_scale.base_strategy != 'last_round':
-            return
         messages = inputs.messages
         first_tool_index = len(messages)
         for i, message in enumerate(messages):

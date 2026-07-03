@@ -1,13 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import concurrent.futures
 import importlib.metadata
-import inspect
 import logging
 import os
 import torch
 import torch.distributed as dist
 from contextlib import contextmanager
-from copy import copy
+from copy import copy, deepcopy
 from packaging import version
 from tqdm import tqdm
 from transformers.modeling_utils import custom_object_save
@@ -98,9 +97,6 @@ def _patch_unified_memory():
     if is_torch_npu_available():
         return
 
-    mcore_015 = version.parse(importlib.metadata.version('megatron-core')) >= version.parse('0.15.0rc0')
-    if not mcore_015:
-        return
     from torch.utils import cpp_extension
     load_inline = cpp_extension.load_inline
 
@@ -121,7 +117,7 @@ def _patch_unified_memory():
 
 
 def _patch_mcore_bridge():
-    require_version('mcore-bridge>=1.2.0', 'please install mcore-bridge via `pip install mcore-bridge -U`')
+    require_version('mcore-bridge>=1.4.0', 'please install mcore-bridge via `pip install mcore-bridge -U`')
     import mcore_bridge
     from mcore_bridge import GPTBridge
     logger.info(f'mcore_bridge.__version__: {mcore_bridge.__version__}')
@@ -140,7 +136,7 @@ def _patch_mcore_bridge():
         if processor is None or args is None:
             return
         hf_config = self.config.hf_config
-        hf_config = copy(hf_config)
+        hf_config = deepcopy(hf_config)
         if is_master() and not hasattr(self, 'hf_model'):
             if hasattr(self, 'get_hf_meta_model'):
                 self.hf_model = self.get_hf_meta_model()
@@ -180,16 +176,17 @@ def _patch_mcore_bridge():
                             break
                     else:
                         llm_config.num_nextn_predict_layers = config.mtp_num_layers
+                HfConfigFactory.del_config_attr(hf_config, 'quantization_config')
+                expert_dtype = None
                 if config.fp8 is not None and config.fp8_recipe == 'blockwise' and config.fp8_param:
-                    if getattr(hf_config, 'quantization_config', None) is None:
-                        from transformers.utils.quantization_config import FineGrainedFP8Config
-                        modules_to_not_convert = get_modules_to_not_convert(self.hf_model)
-                        if hasattr(self, '_fp8_skip_modules'):
-                            modules_to_not_convert = (modules_to_not_convert or []) + list(self._fp8_skip_modules)
-                        hf_config.quantization_config = FineGrainedFP8Config(
-                            modules_to_not_convert=modules_to_not_convert)
-                elif hasattr(hf_config, 'quantization_config'):
-                    del hf_config.quantization_config
+                    from transformers.utils.quantization_config import FineGrainedFP8Config
+                    modules_to_not_convert = get_modules_to_not_convert(self.hf_model)
+                    if hasattr(self, '_fp8_skip_modules'):
+                        modules_to_not_convert = (modules_to_not_convert or []) + list(self._fp8_skip_modules)
+                    hf_config.quantization_config = FineGrainedFP8Config(modules_to_not_convert=modules_to_not_convert)
+                    expert_dtype = 'fp8'
+                if args.model_type == 'deepseek_v4':
+                    HfConfigFactory.set_config_attr(hf_config, 'expert_dtype', expert_dtype)
                 hf_config.save_pretrained(output_dir)
                 if getattr(self.hf_model, '_auto_class') is not None:
                     try:

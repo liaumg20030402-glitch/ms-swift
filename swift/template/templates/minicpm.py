@@ -2,12 +2,14 @@
 import math
 import numpy as np
 import torch
+import transformers
 from dataclasses import dataclass, field
 from functools import partial
+from packaging import version
 from torch import nn
 from typing import Any, Dict, List, Literal, Optional
 
-from swift.utils import get_env_args
+from swift.utils import get_env_args, get_packed_seq_params
 from ..base import Template
 from ..constant import LLMTemplateType, MLLMTemplateType
 from ..register import TemplateMeta, register_template
@@ -603,4 +605,115 @@ register_template(
         MLLMTemplateType.minicpmo4_5,
         template_cls=MiniCPMO4_5Template,
         is_thinking=True,
+    ))
+
+
+class MiniCPMV4_6Template(Template):
+    support_padding_free = True
+    placeholder_tokens = ['<|image_pad|>', '<|video_pad|>']
+
+    def init_env_args(self):
+        super().init_env_args()
+        transformers_version = version.parse(transformers.__version__)
+        if (self.padding_free and self.sequence_parallel_size <= 1 and transformers_version < version.parse('5.9.0')):
+            raise RuntimeError('MiniCPM-V 4.6 packing/padding_free with sequence_parallel_size=1 requires '
+                               f'transformers>=5.9.0 (current: {transformers_version}). ')
+        self.downsample_mode = get_env_args('downsample_mode', str, '16x')
+        self.max_slice_nums = get_env_args('max_slice_nums', int, 9)
+        self.video_max_slice_nums = get_env_args('video_max_slice_nums', int, 1)
+        self.max_num_frames = get_env_args('max_num_frames', int, 128)
+        self.stack_frames = get_env_args('stack_frames', int, 1)
+
+    def _preprocess_inputs(self, inputs: StdTemplateInputs) -> None:
+        super()._preprocess_inputs(inputs)
+        # Inject downsample_mode into mm_processor_kwargs so that vLLM rollout
+        # receives the correct mode via _encode_truncated -> _add_request.
+        inputs.mm_processor_kwargs['downsample_mode'] = self.downsample_mode
+
+    def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
+                    inputs: StdTemplateInputs) -> List[Context]:
+        if media_type == 'image':
+            return ['<|image_pad|>\n']
+        else:
+            return ['<|video_pad|>\n']
+
+    def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
+        encoded = super()._encode(inputs)
+        split_token = self._tokenize(self.tokenizer.eos_token)
+        input_ids = encoded['input_ids']
+        labels = encoded['labels']
+        loss_scale = encoded.get('loss_scale', None)
+        for media_type in ['image', 'video']:
+            mm_data = getattr(inputs, f'{media_type}s')
+            media_token = f'<|{media_type}_pad|>'
+            media_token_id = self._tokenize(media_token)[0]
+            max_slice_nums = self.max_slice_nums if media_type == 'image' else self.video_max_slice_nums
+            if mm_data:
+                media_inputs = self.processor(
+                    text=self.tokenizer.eos_token.join([media_token] * len(mm_data)),
+                    images=inputs.images or None,
+                    videos=inputs.videos or None,
+                    return_tensors='pt',
+                    add_special_tokens=False,
+                    downsample_mode=self.downsample_mode,
+                    stack_frames=self.stack_frames,
+                    max_num_frames=self.max_num_frames,
+                    max_slice_nums=max_slice_nums,
+                )
+                splited_tokens = self._split_list(media_inputs['input_ids'][0].tolist(), split_token)
+                idx_list = findall(input_ids, media_token_id)
+
+                def _get_new_tokens(i):
+                    return splited_tokens[i]
+
+                input_ids, labels, loss_scale = self._extend_tokens(input_ids, labels, loss_scale, idx_list,
+                                                                    _get_new_tokens)
+                encoded.update(media_inputs)
+        encoded['input_ids'] = input_ids
+        encoded['labels'] = labels
+        encoded['loss_scale'] = loss_scale
+        return encoded
+
+    def _data_collator_mm_data(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        res = {}
+        pixel_values = [b['pixel_values'] for b in batch if b.get('pixel_values') is not None]
+        if len(pixel_values) > 0:
+            res['pixel_values'] = torch.concat(pixel_values, dim=-1)
+        pixel_values_videos = [b['pixel_values_videos'] for b in batch if b.get('pixel_values_videos') is not None]
+        if len(pixel_values_videos) > 0:
+            res['pixel_values_videos'] = torch.concat(pixel_values_videos, dim=-1)
+
+        for key in ['target_sizes', 'target_sizes_videos']:
+            value = self.concat_tensor(batch, key, dim=0)
+            if value is not None:
+                res[key] = value
+
+        # Inject downsample_mode so the model forward uses the same mode
+        # as data preprocessing, keeping image token/feature counts aligned.
+        res['downsample_mode'] = self.downsample_mode
+        return res
+
+    def _data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
+        res = super()._data_collator(batch, padding_to=padding_to)
+        if self.padding_free:
+            res.update(get_packed_seq_params(res['position_ids']))
+        return res
+
+
+register_template(
+    ChatmlTemplateMeta(
+        MLLMTemplateType.minicpmv4_6,
+        template_cls=MiniCPMV4_6Template,
+        is_thinking=True,
+        thinking_prefix='<think>\n',
+        non_thinking_prefix='<think>\n\n</think>\n\n',
+    ))
+
+register_template(
+    ChatmlTemplateMeta(
+        LLMTemplateType.minicpm5,
+        is_thinking=True,
+        thinking_prefix='<think>\n',
+        non_thinking_prefix='<think>\n\n</think>\n\n',
+        agent_template='minicpm5',
     ))

@@ -97,7 +97,7 @@ Note: If you set "loss"/"loss_scale" on consecutive "tool_call" messages in the 
 ```
 
 - The "chat_template_kwargs" field (requires ms-swift>=4.3.0) allows you to control template multimodal parameters such as min_pixels, max_pixels, fps, as well as parameters like enable_thinking (during inference) at the **sample level** by passing this field in the dataset. The following parameters are supported by different models:
-  - Among them, "enable_thinking" and "response_prefix" are supported by all models (takes effect during inference); the "max_pixels" parameter is supported by all multimodal models.
+  - Among them, "enable_thinking", "preserve_thinking" and "response_prefix" are supported by all models (takes effect during inference); the "max_pixels" parameter is supported by all multimodal models.
   - Qwen series multimodal models: parameters supported by qwen_vl_utils/qwen_omni_utils such as min_pixels, max_pixels, fps, etc.
 
 ```jsonl
@@ -149,6 +149,23 @@ You can also organize the Agent dataset in the following format:
 # It will find the position of the last user in `messages`, and replace the subsequent content with `rejected_response` to form `rejected_messages`
 {"tools": "[{\"type\": \"function\", \"function\": {\"name\": \"realtime_aqi\", \"description\": \"Weather forecast. Get real-time air quality, including current air quality, PM2.5, and PM10 information.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g., Shanghai\"}}, \"required\": [\"city\"]}}}]", "messages": [{"role": "user", "content": "What is the weather like in Beijing and Shanghai today?"}, {"role": "tool_call", "content": "{\"name\": \"realtime_aqi\", \"arguments\": {\"city\": \"Beijing\"}}"}, {"role": "tool_call", "content": "{\"name\": \"realtime_aqi\", \"arguments\": {\"city\": \"Shanghai\"}}"}, {"role": "tool_response", "content": "{\"city\": \"Beijing\", \"aqi\": \"10\", \"unit\": \"celsius\"}"}, {"role": "tool_response", "content": "{\"city\": \"Shanghai\", \"aqi\": \"72\", \"unit\": \"fahrenheit\"}"}, {"role": "assistant", "content": "According to the weather forecast tool, the air quality index (AQI) in Beijing is 10, which indicates good air quality; whereas in Shanghai, the AQI is 72, indicating mild pollution."}], "rejected_response": [{"role": "assistant", "content": "I don't know."}]}
 ```
+
+How to debug:
+
+```python
+from swift import get_processor, get_template
+
+data = {"tools": "[{\"type\": \"function\", \"function\": {\"name\": \"realtime_aqi\", \"description\": \"Weather forecast. Get real-time air quality, including current air quality, PM2.5, and PM10 information.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g., Shanghai\"}}, \"required\": [\"city\"]}}}]", "messages": [{"role": "user", "content": "What is the weather like in Beijing and Shanghai today?"}, {"role": "tool_call", "content": "{\"name\": \"realtime_aqi\", \"arguments\": {\"city\": \"Beijing\"}}"}, {"role": "tool_call", "content": "{\"name\": \"realtime_aqi\", \"arguments\": {\"city\": \"Shanghai\"}}"}, {"role": "tool_response", "content": "{\"city\": \"Beijing\", \"aqi\": \"10\", \"unit\": \"celsius\"}"}, {"role": "tool_response", "content": "{\"city\": \"Shanghai\", \"aqi\": \"72\", \"unit\": \"fahrenheit\"}"}, {"role": "assistant", "content": "According to the weather forecast tool, the air quality index (AQI) in Beijing is 10, which indicates good air quality; whereas in Shanghai, the AQI is 72, indicating mild pollution."}], "rejected_response": [{"role": "assistant", "content": "I don't know."}]}
+
+template = get_template(get_processor('Qwen/Qwen3.5-4B'), loss_scale='last_round')
+template.set_mode('rlhf')  # For details, refer to the `template_mode` parameter description in the command-line documentation.
+inputs = template.encode(data)
+
+print(template.safe_decode(inputs['chosen_labels']))
+print(template.safe_decode(inputs['rejected_labels']))
+```
+
+
 #### KTO
 
 ```jsonl
@@ -167,14 +184,12 @@ You can also organize the Agent dataset in the following format:
 
 #### GKD
 
-If `seq_kd` is not enabled, i.e., the parameter is set to False, the dataset format is as follows (you can use a teacher model to pre-distill the data):
-
 ```jsonl
 {"messages": [{"role": "system", "content": "You are a useful and harmless assistant"}, {"role": "user", "content": "Tell me tomorrow's weather"}, {"role": "assistant", "content": "Tomorrow's weather will be sunny"}]}
 {"messages": [{"role": "system", "content": "You are a useful and harmless math calculator"}, {"role": "user", "content": "What is 1 + 1?"}, {"role": "assistant", "content": "It equals 2"}, {"role": "user", "content": "What about adding 1?"}, {"role": "assistant", "content": "It equals 3"}]}
 ```
 
-If `seq_kd` is enabled, the final round of the 'assistant' part is not required (the teacher model generates data during training):
+When under on-policy training, the final round of the 'assistant' part is not required (the student model generates data during training, the response from dataset will be removed):
 
 ```jsonl
 {"messages": [{"role": "system", "content": "You are a useful and harmless assistant"}, {"role": "user", "content": "Tell me tomorrow's weather"}]}

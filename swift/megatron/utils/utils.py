@@ -1,27 +1,21 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import megatron.core
 import re
 import torch
 import torch.distributed as dist
-from contextlib import contextmanager
-from mcore_bridge import LoraParallelLinear
 from megatron.core import mpu
 from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
 from megatron.core.inference.communication_utils import recv_from_prev_pipeline_rank_, send_to_next_pipeline_rank
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.mamba_context_parallel import _undo_attention_load_balancing
 from megatron.core.transformer.moe.router import TopKRouter
-from megatron.core.transformer.transformer_block import get_num_layers_to_build
-from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint, sharded_state_dict_default
-from packaging import version
-from peft.tuners.lora import Linear as LoraLinear
-from peft.utils.other import ModulesToSaveWrapper
 from torch import nn
-from typing import Optional, Tuple
+from transformers.utils import is_torch_npu_available
 
 from swift.tuners import LoraConfig, Swift
 from swift.utils import (activate_parameters, deep_getattr, find_layers, freeze_parameters, get_logger,
                          get_model_parameter_info)
+from swift.utils import get_packed_seq_params as _get_packed_seq_params
 
 logger = get_logger()
 
@@ -100,7 +94,7 @@ def get_target_modules(args, model):
         return args.target_modules
     target_modules = args.target_modules.copy()
     if 'all-linear' in target_modules:
-        if args.is_multimodal:
+        if args.is_multimodal and not args.language_model_only:
             if args.tuner_type == 'lora_llm':
                 kwargs = {
                     'freeze_llm': False,
@@ -220,10 +214,65 @@ def get_padding_to(args):
         padding_to = (padding_to or 1) * args.context_parallel_size
     origin_padding_to = padding_to
     fp8_format = getattr(args, 'fp8_format', None) or getattr(args, 'fp8', None)
+    fp4_format = getattr(args, 'fp4_format', None) or getattr(args, 'fp4', None)
     if args.fp8_recipe == 'blockwise':
         padding_to = (padding_to or 1) * 128
-    elif fp8_format is not None:
-        padding_to = max((padding_to or 1) * 8, 16)
+    elif fp8_format is not None or fp4_format is not None:
+        padding_to = (padding_to or 1) * 16
     if args.attention_backend == 'fused':
         padding_to = max(padding_to or 1, ((origin_padding_to) or 1) * 64)
     return padding_to
+
+
+def get_packed_seq_params(position_ids: torch.Tensor) -> PackedSeqParams:
+    params = _get_packed_seq_params(position_ids)
+    packed = PackedSeqParams(
+        cu_seqlens_q=params['cu_seq_lens_q'],
+        cu_seqlens_kv=params['cu_seq_lens_k'],
+        max_seqlen_q=params['max_length_q'],
+        max_seqlen_kv=params['max_length_k'],
+        qkv_format='thd')
+
+    if is_torch_npu_available():
+        packed.cu_seqlens_q_padded = params['cu_seq_lens_q']
+        packed.cu_seqlens_kv_padded = params['cu_seq_lens_k']
+
+    return packed
+
+
+def reconstruct_tensor_cp(tensor, packed_seq_params, dim=1) -> torch.Tensor:
+    """In CP mode, all-gather and undo the load-balanced (zigzag) chunking
+    produced by ``split_cp_inputs``, restoring the full sequence in original
+    token order along ``dim``.
+
+    Args:
+        tensor: CP-sharded local tensor whose sequence dim is at ``dim``.
+        packed_seq_params: ``PackedSeqParams`` for THD inputs, or ``None`` for
+            regular ``[B, S, ...]`` inputs.
+        dim: Sequence dimension index of ``tensor`` (default: 1).
+
+    Returns:
+        torch.Tensor: Full-sequence tensor with the same shape as ``tensor``
+        except the size at ``dim`` is multiplied by ``cp_size``.
+    """
+
+    cp_size = mpu.get_context_parallel_world_size()
+    if cp_size <= 1:
+        return tensor
+
+    cp_rank = mpu.get_context_parallel_rank()
+    cp_group = mpu.get_context_parallel_group()
+
+    # All-gather across CP ranks (preserve local autograd graph for `tensor`).
+    output_list = [torch.empty_like(tensor) for _ in range(cp_size)]
+    torch.distributed.all_gather(output_list, tensor.contiguous(), group=cp_group)
+    output_list[cp_rank] = tensor
+    gathered = torch.cat(output_list, dim=dim)
+
+    # `_undo_attention_load_balancing` assumes sequence dim is 0; transpose if needed.
+    if dim != 0:
+        gathered = gathered.transpose(0, dim).contiguous()
+    out = _undo_attention_load_balancing(gathered, cp_size, packed_seq_params)
+    if dim != 0:
+        out = out.transpose(0, dim).contiguous()
+    return out

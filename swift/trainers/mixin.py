@@ -33,6 +33,11 @@ from transformers.trainer import OPTIMIZER_NAME, PREFIX_CHECKPOINT_DIR, SCHEDULE
 from transformers.trainer import Trainer as HfTrainer
 from transformers.trainer import reissue_pt_warnings
 from transformers.trainer_utils import IntervalStrategy
+
+try:
+    from transformers.trainer_utils import sort_checkpoints
+except ImportError:
+    sort_checkpoints = None
 from types import MethodType
 from typing import Callable, Dict, List, Optional
 
@@ -114,6 +119,8 @@ class SwiftMixin:
         trainer_parameters = inspect.signature(HfTrainer.__init__).parameters
         tokenizer_key = 'processing_class' if 'processing_class' in trainer_parameters else 'tokenizer'
         kwargs[tokenizer_key] = template.tokenizer
+        # Pass callbacks in __init__ to correctly invoke on_init_end
+        callbacks = self._get_callbacks(args)
         with self.hub.patch_hub():
             super().__init__(
                 model=model,
@@ -121,11 +128,11 @@ class SwiftMixin:
                 data_collator=data_collator,
                 train_dataset=train_dataset,
                 eval_dataset=eval_dataset,
+                callbacks=callbacks,
                 **kwargs)
         # fix https://github.com/huggingface/transformers/pull/43919
         if transformers_5:
             self.accelerator.gradient_state.plugin_kwargs['num_steps'] = 1
-        self._add_callbacks()
         if get_function(model.__class__.forward) is not get_function(model.forward):
             self.label_names = find_labels(model)
             self.can_return_loss = can_return_loss(model)
@@ -145,9 +152,11 @@ class SwiftMixin:
         padding_to = template.max_length if args.tuner_type == 'longlora' else None
         return partial(template.data_collator, padding_to=padding_to)
 
-    def _add_callbacks(self):
-        for callback in self.args.callbacks:
-            self.add_callback(callbacks_map[callback](self.args, self))
+    def _get_callbacks(self, args):
+        callbacks = []
+        for callback in args.callbacks:
+            callbacks.append(callbacks_map[callback](args, self))
+        return callbacks
 
     def _collect_config_info(self) -> Dict[str, str]:
         """
@@ -232,6 +241,9 @@ class SwiftMixin:
             init_lora_weights = getattr(config, 'init_lora_weights', None)
             if isinstance(init_lora_weights, str):
                 config = copy(config)
+                # Save requires_grad state to protect against peft inject_adapter side effects
+                # (peft >= 0.18.1 incorrectly freezes active adapter when loading a temporary adapter)
+                requires_grad_state = {n: p.requires_grad for n, p in model.named_parameters()}
                 os.makedirs(os.path.join(output_dir, 'converted'), exist_ok=True)
                 if 'lora-ga' in init_lora_weights:
                     try:
@@ -257,6 +269,10 @@ class SwiftMixin:
                             os.path.dirname(output_dir), 'initial_model'),
                     )
                     model.peft_config['default'] = config
+                # Restore requires_grad state after conversion to prevent peft side effects
+                for n, p in model.named_parameters():
+                    if n in requires_grad_state:
+                        p.requires_grad = requires_grad_state[n]
 
     def _load_rng_state(self, *args, **kwargs):
         if self.args.resume_only_model:
@@ -267,6 +283,12 @@ class SwiftMixin:
         if self.args.resume_only_model:
             return
         super()._load_optimizer_and_scheduler(*args, **kwargs)
+        callbacks = set(getattr(self.args, 'callbacks', []))
+        ds_config = getattr(self.args, 'deepspeed', None) or {}
+        checkpoint_config = ds_config.get('checkpoint') if isinstance(ds_config, dict) else None
+        load_universal = isinstance(checkpoint_config, dict) and checkpoint_config.get('load_universal', False)
+        if 'deepspeed_elastic' in callbacks and load_universal:
+            self._fix_optimizer_step_device(self.optimizer)
         if is_mp_ddp():
             # fix mp+ddp adamw
             for v in self.optimizer.state.values():
@@ -276,7 +298,32 @@ class SwiftMixin:
                     if len(device_set) >= 1:
                         v['step'] = v['step'].to('cpu')
 
+    @staticmethod
+    def _fix_optimizer_step_device(optimizer):
+        state = getattr(optimizer, 'state', None)
+        if not isinstance(state, dict):
+            return
+        for value in state.values():
+            if not isinstance(value, dict):
+                continue
+            step = value.get('step')
+            if not isinstance(step, torch.Tensor):
+                continue
+            target_device = None
+            for state_key, state_value in value.items():
+                if state_key == 'step':
+                    continue
+                if isinstance(state_value, torch.Tensor) and state_value.device.type != 'cpu':
+                    target_device = state_value.device
+                    break
+            if target_device is not None and step.device != target_device:
+                value['step'] = step.to(target_device)
+
     def _save_model(self, output_dir: Optional[str] = None, state_dict=None):
+        # If template defines a save_callback, delegate to it
+        if hasattr(self, 'template') and hasattr(self.template, 'save_callback'):
+            self.template.save_callback(self.model, output_dir)
+            return
         # model
         supported_classes = (SwiftModel, PreTrainedModel, PeftModel)
         supported_names = ('SentenceTransformer', )
@@ -404,7 +451,24 @@ class SwiftMixin:
         last_step = self._get_last_checkpoint_step()
 
         # Check if we should delete older checkpoint(s)
-        checkpoints_sorted = self._sorted_checkpoints(use_mtime=use_mtime, output_dir=output_dir)
+        if hasattr(self, '_sorted_checkpoints'):
+            checkpoints_sorted = self._sorted_checkpoints(use_mtime=use_mtime, output_dir=output_dir)
+        else:
+            output_dir = output_dir if output_dir is not None else self.args.output_dir
+            if sort_checkpoints is not None:
+                checkpoints_sorted = sort_checkpoints(
+                    output_dir=output_dir,
+                    checkpoint_prefix=PREFIX_CHECKPOINT_DIR,
+                    use_mtime=use_mtime,
+                    best_model_checkpoint=self.state.best_model_checkpoint,
+                )
+            else:
+                checkpoints = []
+                for path in os.listdir(output_dir) if os.path.isdir(output_dir) else []:
+                    if re.match(f'^{PREFIX_CHECKPOINT_DIR}-([0-9]+)$', path):
+                        checkpoints.append(os.path.join(output_dir, path))
+                ordering = os.path.getmtime if use_mtime else lambda path: int(path.rsplit('-', 1)[-1])
+                checkpoints_sorted = sorted(checkpoints, key=ordering)
 
         valid_checkpoints = []
         for path in checkpoints_sorted:
@@ -993,12 +1057,15 @@ class SwiftMixin:
         self.optimizer_callback.create_optimizer_and_scheduler(num_training_steps)
 
     def create_optimizer(self, model=None):
-        self.optimizer = self.optimizer_callback.create_optimizer(model=model)
+        self._optimizer_ori = self.optimizer = self.optimizer_callback.create_optimizer(model=model)
         if self.optimizer is not None:
             self.optimizer.param_groups = [pg for pg in self.optimizer.param_groups if len(pg['params']) > 0]
         return self.optimizer
 
     def create_scheduler(self, num_training_steps: int, optimizer=None):
+        if optimizer is None:
+            # fix deepspeed & cosine_with_min_lr (transformers 5.8.0)
+            optimizer = getattr(self, '_optimizer_ori', None)
         self.lr_scheduler = self.optimizer_callback.create_scheduler(num_training_steps, optimizer)
         return self.lr_scheduler
 

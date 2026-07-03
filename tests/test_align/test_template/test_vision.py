@@ -2,6 +2,7 @@ import os
 import torch
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1,2,3'
 os.environ['SWIFT_DEBUG'] = '1'
 
 
@@ -920,6 +921,17 @@ def test_minicpmv4_5():
     assert response == response2
 
 
+def test_minicpmv4_6():
+    engine = TransformersEngine('OpenBMB/MiniCPM-V-4.6')
+    images = ['http://images.cocodataset.org/val2017/000000039769.jpg']
+    messages = [{'role': 'user', 'content': 'Please describe the image explicitly.'}]
+    engine.template.enable_thinking = False
+    response = _infer_model(engine, messages=messages, images=images)
+    engine.template.template_backend = 'jinja'
+    response2 = _infer_model(engine, messages=messages, images=images)
+    assert response == response2
+
+
 def _run_qwen3_vl_hf(messages, model, processor):
     from qwen_vl_utils import process_vision_info
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -1021,6 +1033,7 @@ def test_llava_onevision1_5():
 
 def test_paddle_ocr():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0'
     engine = TransformersEngine('PaddlePaddle/PaddleOCR-VL')
     query = 'OCR:'
     messages = [{'role': 'user', 'content': query}]
@@ -1189,6 +1202,7 @@ def test_step3_vl():
 
 def test_paddle_ocr_1_5():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0'
     engine = TransformersEngine('PaddlePaddle/PaddleOCR-VL-1.5')
     query = 'OCR:'
     messages = [{'role': 'user', 'content': query}]
@@ -1246,6 +1260,15 @@ def test_mineru2_5_pro():
         'content': '<image>\nText Recognition:',
     }]
     response = _infer_model(engine, messages=messages, images=images)
+    print(response)
+
+
+def test_unlimited_ocr():
+    engine = TransformersEngine('PaddlePaddle/Unlimited-OCR')
+    query = 'Free OCR.'
+    messages = [{'role': 'user', 'content': query}]
+    images = ['http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/ocr.png']
+    response = _infer_model(engine, messages=messages, images=images, max_tokens=256)
     print(response)
 
 
@@ -1315,6 +1338,7 @@ if __name__ == '__main__':
     # test_interns1()
     # test_internvl3_5()
     # test_minicpmv4_5()
+    test_minicpmv4_6()
     # test_qwen3_vl()
     # test_keye_vl_1_5()
     # test_internvl3_hf()
@@ -1337,4 +1361,5 @@ if __name__ == '__main__':
     # test_paddle_ocr_1_5()
     # test_glm_ocr()
     # test_gemma4()
-    test_mineru2_5_pro()
+    # test_mineru2_5_pro()
+    # test_unlimited_ocr()

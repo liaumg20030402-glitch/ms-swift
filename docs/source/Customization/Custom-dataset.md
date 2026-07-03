@@ -95,7 +95,7 @@ print(inputs['loss_scale'])
 ```
 
 - "chat_template_kwargs"字段，（需ms-swift>=4.3.0），你可以通过在数据集中传入该字段**样本级别**控制template的min_pixels, max_pixels, fps等多模态参数，以及enable_thinking（推理时）等参数。以下为不同模型支持的参数：
-  - 其中"enable_thinking", "response_prefix"支持所有模型（推理时生效）；"max_pixels"参数支持所有多模态模型。
+  - 其中"enable_thinking", "preserve_thinking", "response_prefix"支持所有模型（推理时生效）；"max_pixels"参数支持所有多模态模型。
   - Qwen系列多模态模型：min_pixels, max_pixels, fps等qwen_vl_utils/qwen_omni_utils支持的参数。
 ```jsonl
 {"messages": [{"role": "user", "content": "<image>这是什么"}, {"role": "assistant", "content": "这是一只兔子", "loss": false}], "chat_template_kwargs": {"max_pixels": 1048576}}
@@ -146,6 +146,21 @@ print(inputs['loss_scale'])
 {"tools": "[{\"type\": \"function\", \"function\": {\"name\": \"realtime_aqi\", \"description\": \"天气预报。获取实时空气质量。当前空气质量，PM2.5，PM10信息\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"城市名，例如：上海\"}}, \"required\": [\"city\"]}}}]", "messages": [{"role": "user", "content": "北京和上海今天的天气情况"}, {"role": "tool_call", "content": "{\"name\": \"realtime_aqi\", \"arguments\": {\"city\": \"北京\"}}"}, {"role": "tool_call", "content": "{\"name\": \"realtime_aqi\", \"arguments\": {\"city\": \"上海\"}}"}, {"role": "tool_response", "content": "{\"city\": \"北京\", \"aqi\": \"10\", \"unit\": \"celsius\"}"}, {"role": "tool_response", "content": "{\"city\": \"上海\", \"aqi\": \"72\", \"unit\": \"fahrenheit\"}"}, {"role": "assistant", "content": "根据天气预报工具，北京今天的空气质量指数为10，属于良好水平；上海今天的空气质量指数为72，属于轻度污染水平。"}], "rejected_response": [{"role": "assistant", "content": "我不知道。"}]}
 ```
 
+如何debug:
+
+```python
+from swift import get_processor, get_template
+
+data = {"tools": "[{\"type\": \"function\", \"function\": {\"name\": \"realtime_aqi\", \"description\": \"天气预报。获取实时空气质量。当前空气质量，PM2.5，PM10信息\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"城市名，例如：上海\"}}, \"required\": [\"city\"]}}}]", "messages": [{"role": "user", "content": "北京和上海今天的天气情况"}, {"role": "tool_call", "content": "{\"name\": \"realtime_aqi\", \"arguments\": {\"city\": \"北京\"}}"}, {"role": "tool_call", "content": "{\"name\": \"realtime_aqi\", \"arguments\": {\"city\": \"上海\"}}"}, {"role": "tool_response", "content": "{\"city\": \"北京\", \"aqi\": \"10\", \"unit\": \"celsius\"}"}, {"role": "tool_response", "content": "{\"city\": \"上海\", \"aqi\": \"72\", \"unit\": \"fahrenheit\"}"}, {"role": "assistant", "content": "根据天气预报工具，北京今天的空气质量指数为10，属于良好水平；上海今天的空气质量指数为72，属于轻度污染水平。"}], "rejected_response": [{"role": "assistant", "content": "我不知道。"}]}
+
+template = get_template(get_processor('Qwen/Qwen3.5-4B'), loss_scale='last_round')
+template.set_mode('rlhf')  # 具体查看命令行文档 `template_mode` 参数的介绍
+inputs = template.encode(data)
+
+print(template.safe_decode(inputs['chosen_labels']))
+print(template.safe_decode(inputs['rejected_labels']))
+```
+
 #### KTO
 
 ```jsonl
@@ -163,13 +178,13 @@ print(inputs['loss_scale'])
 - 注意：GRPO会透传所有额外的字段内容给ORM，而不像其他训练方法，默认将额外的字段删除。例如: 你可以额外传入'solution'。自定义的ORM需要包含一个位置参数completions，其他为关键词参数，由数据集额外字段透传。
 
 #### GKD
-若未开启`seq_kd`，即该参数为False。数据集格式如下（你可使用teacher模型提前蒸馏）：
+数据集格式如下
 ```jsonl
 {"messages": [{"role": "system", "content": "你是个有用无害的助手"}, {"role": "user", "content": "告诉我明天的天气"}, {"role": "assistant", "content": "明天天气晴朗"}]}
 {"messages": [{"role": "system", "content": "你是个有用无害的数学计算器"}, {"role": "user", "content": "1+1等于几"}, {"role": "assistant", "content": "等于2"}, {"role": "user", "content": "再加1呢"}, {"role": "assistant", "content": "等于3"}]}
 ```
 
-若开启`seq_kd`，则不需要最后一轮的'assistant'部分（teacher模型在训练时生成数据）：
+若是在线生成训练(lmbda>0)，不需要response部分（学生模型在线生成，数据集中的response部分会被删除）
 ```jsonl
 {"messages": [{"role": "system", "content": "你是个有用无害的助手"}, {"role": "user", "content": "告诉我明天的天气"}]}
 {"messages": [{"role": "system", "content": "你是个有用无害的数学计算器"}, {"role": "user", "content": "1+1等于几"}, {"role": "assistant", "content": "等于2"}, {"role": "user", "content": "再加1呢"}]}

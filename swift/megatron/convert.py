@@ -25,6 +25,7 @@ convert_kwargs = {
     'finetune': True,
     'attention_backend': 'unfused',
     'padding_free': False,
+    'recompute_granularity': 'none',  # deepseek-v4
 }
 
 
@@ -99,9 +100,8 @@ def convert_mcore2hf(args: ExportArguments) -> None:
         logger.info('Converting weights and saving the model...')
         bridge.save_weights([mg_model], args.output_dir, args=megatron_args, processor=processor)
         if is_master():
-            args_path = os.path.join(megatron_args.mcore_adapter or megatron_args.mcore_model or args.model,
-                                     'args.json')
-            if os.path.exists(args_path):
+            if args.ckpt_dir:
+                args_path = os.path.join(args.ckpt_dir, 'args.json')
                 shutil.copy(args_path, os.path.join(args.output_dir, 'args.json'))
             else:
                 args.save_args(args.output_dir)

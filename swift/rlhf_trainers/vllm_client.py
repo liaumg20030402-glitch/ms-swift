@@ -16,9 +16,10 @@ from urllib.parse import urlparse
 from swift.infer_engine import AdapterRequest, RequestConfig
 from swift.infer_engine.protocol import ChatCompletionResponse, RolloutInferRequest, RolloutOutput
 from swift.metrics import Metric
-from swift.utils import (get_torch_device, is_trl_available, is_vllm_ascend_available, is_vllm_available,
-                         is_vllm_metax_available, synchronize)
-from .utils import format_host_for_url, is_valid_ipv6_address, peft_config_to_dict, resolve_hostname
+from swift.utils import (is_trl_available, is_vllm_ascend_available, is_vllm_available, is_vllm_metax_available,
+                         synchronize)
+from .utils import (broadcast_tensor_for_vllm_weight_sync, format_host_for_url, is_valid_ipv6_address,
+                    peft_config_to_dict, resolve_hostname)
 
 if is_vllm_available():
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -37,13 +38,15 @@ if is_trl_available():
 logger = logging.getLogger(__name__)
 
 
-class VLLMClient:
+class VLLMInferClient:
+    """Inference-only vLLM client. Posts to /infer/ endpoint.
+    No weight synchronization. Used for GKD teacher server etc.
+    """
 
     def __init__(self,
                  base_urls: Optional[List[str]] = None,
                  hosts: List[str] = ['0.0.0.0'],
                  server_ports: List[int] = [8000],
-                 group_ports: Optional[Union[int, List[int]]] = None,
                  connection_timeout: float = 240.0):
         if not is_vllm_available():
             raise ImportError('vLLM is not installed. Please install it with `pip install vllm`.')
@@ -67,20 +70,7 @@ class VLLMClient:
             self.hosts = hosts
 
         self.num_servers = len(self.base_urls)
-
-        if group_ports is None:
-            group_ports = [51216 + i for i in range(self.num_servers)]
-
         self.sessions = [requests.Session() for _ in range(self.num_servers)]
-
-        if isinstance(group_ports, int):
-            self.group_ports = [group_ports + i for i in range(self.num_servers)]
-        elif isinstance(group_ports, list) and len(group_ports) == self.num_servers:
-            self.group_ports = group_ports
-        else:
-            raise ValueError('group_port must be int or list of length num_servers')
-
-        self.pynccl_comms = []
         self.check_server(connection_timeout)
 
     def check_server(self, total_timeout: float = 0.0, retry_interval: float = 2.0):
@@ -127,9 +117,6 @@ class VLLMClient:
         use_tqdm: Optional[bool] = None,
         adapter_request: Optional[AdapterRequest] = None,
     ):
-        if not hasattr(self, 'use_async_engine') or not hasattr(self, 'use_gym_env'):
-            self.get_engine_type()
-
         n = len(infer_requests)
         chunk_size = (n + self.num_servers - 1) // self.num_servers
         chunks = [infer_requests[i:i + chunk_size] for i in range(0, n, chunk_size)]
@@ -183,6 +170,30 @@ class VLLMClient:
 
         return [res for server_results in results for res in server_results]
 
+
+class VLLMClient(VLLMInferClient):
+
+    def __init__(self,
+                 base_urls: Optional[List[str]] = None,
+                 hosts: List[str] = ['0.0.0.0'],
+                 server_ports: List[int] = [8000],
+                 group_ports: Optional[Union[int, List[int]]] = None,
+                 connection_timeout: float = 240.0):
+        super().__init__(
+            base_urls=base_urls, hosts=hosts, server_ports=server_ports, connection_timeout=connection_timeout)
+
+        if group_ports is None:
+            group_ports = [51216 + i for i in range(self.num_servers)]
+
+        if isinstance(group_ports, int):
+            self.group_ports = [group_ports + i for i in range(self.num_servers)]
+        elif isinstance(group_ports, list) and len(group_ports) == self.num_servers:
+            self.group_ports = group_ports
+        else:
+            raise ValueError('group_port must be int or list of length num_servers')
+
+        self.pynccl_comms = []
+
     def init_communicator(self, device: Union[int, str] = 0):
         self.pynccl_comms = []
         for i in range(self.num_servers):
@@ -209,6 +220,9 @@ class VLLMClient:
 
             pg = StatelessProcessGroup.create(
                 host=self.hosts[i], port=self.group_ports[i], rank=rank, world_size=world_size)
+            if is_vllm_ascend_available():
+                import torch_npu
+                torch_npu.npu.set_device(device)
             comm = PyNcclCommunicator(pg, device=device)
             self.pynccl_comms.append(comm)
 
@@ -234,11 +248,7 @@ class VLLMClient:
                     raise Exception(f'Server {i} update failed: {response.text}')
 
                 synchronize()
-                self.pynccl_comms[i].broadcast(
-                    weights,
-                    src=self.pynccl_comms[i].rank,
-                    stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
-
+                broadcast_tensor_for_vllm_weight_sync(self.pynccl_comms[i], weights, src=self.pynccl_comms[i].rank)
                 synchronize()
                 self.pynccl_comms[i].group.barrier()
             except Exception as e:
@@ -283,10 +293,8 @@ class VLLMClient:
                     raise Exception(f'Server {i} update adapter failed: {response.text}')
 
                 synchronize()
-                self.pynccl_comms[i].broadcast(
-                    flattened_tensor,
-                    src=self.pynccl_comms[i].rank,
-                    stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
+                broadcast_tensor_for_vllm_weight_sync(
+                    self.pynccl_comms[i], flattened_tensor, src=self.pynccl_comms[i].rank)
                 synchronize()
                 self.pynccl_comms[i].group.barrier()
             except Exception as e:
@@ -345,10 +353,7 @@ class VLLMClient:
                 # Broadcast each tensor individually
                 synchronize()
                 for name, param in lora_params.items():
-                    self.pynccl_comms[i].broadcast(
-                        param,
-                        src=self.pynccl_comms[i].rank,
-                        stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
+                    broadcast_tensor_for_vllm_weight_sync(self.pynccl_comms[i], param, src=self.pynccl_comms[i].rank)
                 synchronize()
                 self.pynccl_comms[i].group.barrier()
             except Exception as e:
@@ -388,10 +393,8 @@ class VLLMClient:
                     raise Exception(f'Server {i} update flattened params failed: {response.text}')
 
                 synchronize()
-                self.pynccl_comms[i].broadcast(
-                    flattened_tensor,
-                    src=self.pynccl_comms[i].rank,
-                    stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
+                broadcast_tensor_for_vllm_weight_sync(
+                    self.pynccl_comms[i], flattened_tensor, src=self.pynccl_comms[i].rank)
                 synchronize()
                 self.pynccl_comms[i].group.barrier()
             except Exception as e:
@@ -405,6 +408,31 @@ class VLLMClient:
         all_errors = [e for e in errors if e is not None]
         if all_errors:
             raise RuntimeError(f'Multiple errors: {all_errors}')
+
+    def process_weights_after_loading(self):
+        """Trigger process_weights_after_loading on all vLLM workers.
+
+        Must be called **once** after ALL weight buckets have been
+        sent via ``update_flattened_params``.  This mirrors the
+        pattern used by verl and ROLL.
+        """
+        errors = [None] * self.num_servers
+
+        def _process_single_server(i):
+            try:
+                response = self.sessions[i].post(f'{self.base_urls[i]}/process_weights_after_loading/', )
+                if response.status_code != 200:
+                    raise Exception(f'Server {i} process_weights_after_loading failed: {response.text}')
+            except Exception as e:
+                errors[i] = e
+
+        with ThreadPoolExecutor(max_workers=self.num_servers) as executor:
+            futures = [executor.submit(_process_single_server, i) for i in range(self.num_servers)]
+            for future in futures:
+                future.result()
+        all_errors = [e for e in errors if e is not None]
+        if all_errors:
+            raise RuntimeError(f'Multiple errors on process_weights_after_loading: {all_errors}')
 
     def update_model_params(self, model: nn.Module):
         for name, param in model.named_parameters():
@@ -428,6 +456,44 @@ class VLLMClient:
         all_errors = [e for e in errors if e is not None]
         if all_errors:
             raise RuntimeError(f'Multiple errors on reset_prefix_cache: {all_errors}')
+
+    def reset_encoder_cache(self):
+        errors = [None] * self.num_servers
+
+        def _reset_single_server(i):
+            try:
+                response = self.sessions[i].post(f'{self.base_urls[i]}/reset_encoder_cache/')
+                if response.status_code != 200:
+                    raise Exception(f'Server {i} reset failed: {response.text}')
+            except Exception as e:
+                errors[i] = e
+
+        with ThreadPoolExecutor(max_workers=self.num_servers) as executor:
+            futures = [executor.submit(_reset_single_server, i) for i in range(self.num_servers)]
+            for future in futures:
+                future.result()
+        all_errors = [e for e in errors if e is not None]
+        if all_errors:
+            raise RuntimeError(f'Multiple errors on reset_encoder_cache: {all_errors}')
+
+    def reset_mm_cache(self):
+        errors = [None] * self.num_servers
+
+        def _reset_single_server(i):
+            try:
+                response = self.sessions[i].post(f'{self.base_urls[i]}/reset_mm_cache/')
+                if response.status_code != 200:
+                    raise Exception(f'Server {i} reset failed: {response.text}')
+            except Exception as e:
+                errors[i] = e
+
+        with ThreadPoolExecutor(max_workers=self.num_servers) as executor:
+            futures = [executor.submit(_reset_single_server, i) for i in range(self.num_servers)]
+            for future in futures:
+                future.result()
+        all_errors = [e for e in errors if e is not None]
+        if all_errors:
+            raise RuntimeError(f'Multiple errors on reset_mm_cache: {all_errors}')
 
     def get_engine_type(self):
         # assume that all server has same engine type

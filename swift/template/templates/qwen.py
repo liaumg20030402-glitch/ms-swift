@@ -1,5 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
+import json
+import numpy as np
+import os
+import shutil
 import torch
 import torch.nn.functional as F
 import transformers
@@ -149,7 +153,10 @@ qwen3_reranker_system = (
 
 register_template(
     Qwen3MixedTemplateMeta(
-        LLMTemplateType.qwen3_reranker, default_system=qwen3_reranker_system, template_cls=Qwen3RerankerTemplate))
+        LLMTemplateType.qwen3_reranker,
+        default_system=qwen3_reranker_system,
+        template_cls=Qwen3RerankerTemplate,
+        agent_template=None))
 
 register_template(Qwen2_5MathTemplateMeta(LLMTemplateType.qwen2_5_math))
 
@@ -217,7 +224,7 @@ class QwenVLTemplate(Template):
         return [f'<box>{self._get_bbox_str(bbox)}</box>']
 
 
-register_template(QwenTemplateMeta(MLLMTemplateType.qwen_vl, template_cls=QwenVLTemplate))
+register_template(QwenTemplateMeta(MLLMTemplateType.qwen_vl, template_cls=QwenVLTemplate, agent_template=None))
 
 
 class QwenAudioTemplate(Template):
@@ -251,7 +258,7 @@ class QwenAudioTemplate(Template):
         return res
 
 
-register_template(QwenTemplateMeta(MLLMTemplateType.qwen_audio, template_cls=QwenAudioTemplate))
+register_template(QwenTemplateMeta(MLLMTemplateType.qwen_audio, template_cls=QwenAudioTemplate, agent_template=None))
 
 
 class Qwen2AudioTemplate(Template):
@@ -303,11 +310,18 @@ class Qwen2VLTemplate(Template):
     version = 'v2'
     use_model = True
     support_padding_free = True
+    _requires_mm_token_type_ids = True
 
     def init_env_args(self):
         super().init_env_args()
         self.transformers_version = version.parse(transformers.__version__)
         self.bbox_format = get_env_args('QWENVL_BBOX_FORMAT', str, 'legacy')
+        self.transformers_5_3 = self.transformers_version >= version.parse('5.3.0')
+        self.transformers_5_9 = self.transformers_version >= version.parse('5.9.0')
+
+    @property
+    def requires_mm_token_type_ids(self):
+        return self.transformers_5_3 and self._requires_mm_token_type_ids
 
     def _get_max_pixels(self, inputs=None):
         return self.max_pixels
@@ -368,6 +382,7 @@ class Qwen2VLTemplate(Template):
         input_ids = encoded['input_ids']
         labels = encoded['labels']
         loss_scale = encoded.get('loss_scale', None)
+        mm_mask = [False] * len(input_ids)
         for media_type in ['images', 'videos']:
             mm_data = getattr(inputs, media_type)
             if mm_data:
@@ -397,13 +412,15 @@ class Qwen2VLTemplate(Template):
                     token_len = (media_grid_thw[i].prod() // merge_length)
                     return [media_token] * token_len
 
-                input_ids, labels, loss_scale = self._extend_tokens(input_ids, labels, loss_scale, idx_list,
-                                                                    _get_new_tokens)
+                input_ids, labels, loss_scale, mm_mask = self._extend_tokens(
+                    input_ids, labels, loss_scale, idx_list, _get_new_tokens, mm_mask=mm_mask)
                 encoded.update(media_inputs)
 
         encoded['input_ids'] = input_ids
         encoded['labels'] = labels
         encoded['loss_scale'] = loss_scale
+        if self.requires_mm_token_type_ids and any(mm_mask):
+            encoded['mm_token_type_ids'] = self.create_mm_token_type_ids(input_ids, mm_mask)
         return encoded
 
     def forward_context(self, model, inputs):
@@ -441,30 +458,33 @@ class Qwen2VLTemplate(Template):
         for r in row:
             r_copy = r.copy()
             r_copy['input_ids'] = torch.tensor(r_copy['input_ids'])[None]
+            if 'mm_token_type_ids' in r_copy:
+                r_copy['mm_token_type_ids'] = r_copy['mm_token_type_ids'][None]
             r.update(self._get_position_ids(r_copy))
         packed = super().packing_row(row)
         return packed
+
+    def _get_get_rope_index(self):
+        base_model = self.get_base_model(self._get_model())
+        if hasattr(base_model, 'get_rope_index'):
+            get_rope_index = base_model.get_rope_index
+        else:
+            get_rope_index = base_model.model.get_rope_index
+        return get_rope_index
 
     def _get_position_ids(self, inputs: Dict[str, Any]):
         # fix https://github.com/huggingface/transformers/pull/33487
         kwargs = {}
         if self.version == 'v2_5':
             kwargs = {'second_per_grid_ts': inputs.get('second_per_grid_ts')}
-        base_model = self.get_base_model(self._get_model())
-        if hasattr(base_model, 'get_rope_index'):
-            get_rope_index = base_model.get_rope_index
-        else:
-            get_rope_index = base_model.model.get_rope_index
         attention_mask = inputs.get('attention_mask_2d')
         if attention_mask is None:
             attention_mask = inputs.get('attention_mask')
         input_ids = inputs['input_ids']
-        if 'mm_token_type_ids' in inspect.signature(get_rope_index).parameters:
-            kwargs['mm_token_type_ids'] = self.create_mm_token_type_ids(input_ids)
-        elif not self.is_training:
-            # Compatible with older versions of transformers
-            return {}
-        position_ids, _ = get_rope_index(
+        mm_token_type_ids = inputs.get('mm_token_type_ids')
+        if mm_token_type_ids is not None:
+            kwargs['mm_token_type_ids'] = mm_token_type_ids
+        position_ids, _ = self._get_get_rope_index()(
             input_ids,
             image_grid_thw=inputs.get('image_grid_thw'),
             video_grid_thw=inputs.get('video_grid_thw'),
@@ -473,6 +493,10 @@ class Qwen2VLTemplate(Template):
         return {'position_ids': self._concat_text_position_ids(position_ids)}
 
     def _data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
+        if self.requires_mm_token_type_ids:
+            for b in batch:
+                if 'input_ids' in b and 'mm_token_type_ids' not in b:
+                    b['mm_token_type_ids'] = torch.zeros(len(b['input_ids']), dtype=torch.int64)
         res = super()._data_collator(batch, padding_to=padding_to)
         if not self.padding_free:
             res.update(self._get_position_ids(res))
@@ -520,6 +544,7 @@ class Qwen3VLTemplate(Qwen2VLTemplate):
         input_ids = encoded['input_ids']
         labels = encoded['labels']
         loss_scale = encoded.get('loss_scale', None)
+        mm_mask = [False] * len(input_ids)
         for media_type in ['images', 'videos']:
             mm_data = getattr(inputs, media_type)
             if mm_data:
@@ -550,13 +575,15 @@ class Qwen3VLTemplate(Qwen2VLTemplate):
                     else:
                         return splited_tokens[i]
 
-                input_ids, labels, loss_scale = self._extend_tokens(input_ids, labels, loss_scale, idx_list,
-                                                                    _get_new_tokens)
+                input_ids, labels, loss_scale, mm_mask = self._extend_tokens(
+                    input_ids, labels, loss_scale, idx_list, _get_new_tokens, mm_mask=mm_mask)
                 encoded.update(media_inputs)
 
         encoded['input_ids'] = input_ids
         encoded['labels'] = labels
         encoded['loss_scale'] = loss_scale
+        if self.requires_mm_token_type_ids and any(mm_mask):
+            encoded['mm_token_type_ids'] = self.create_mm_token_type_ids(input_ids, mm_mask)
         return encoded
 
     def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
@@ -571,6 +598,12 @@ register_template(
 class Qwen3_5Template(Qwen3VLTemplate):
     image_token_id = 248056
     video_token_id = 248057
+
+    def init_env_args(self) -> None:
+        super().init_env_args()
+        if (self.padding_free and self.sequence_parallel_size <= 1 and not self.transformers_5_9):
+            raise RuntimeError('Qwen3.5 packing/padding_free with sequence_parallel_size=1 requires '
+                               f'transformers>=5.9.0 (current: {self.transformers_version}). ')
 
     def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
         return Qwen2VLTemplate._post_encode(self, model, inputs)
@@ -654,9 +687,20 @@ register_template(
         MLLMTemplateType.qwen3_vl_reranker, default_system=qwen3_reranker_system, template_cls=Qwen3VLRerankerTemplate))
 
 
+# ref: trim to hop multiple so WhisperFeatureExtractor matches native HF (floor frames);
+# vLLM pad_to_hop_length becomes no-op on pre-trimmed waveforms (GRPO train/rollout align).
+def trim_audio_to_hop_length(x: np.ndarray, hop_length: int) -> np.ndarray:
+    length = x.shape[-1]
+    aligned = (length // hop_length) * hop_length
+    if 0 < aligned < length:
+        x = x[..., :aligned]
+    return x
+
+
 class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
     version = 'omni_v2_5'
     placeholder_tokens = ['<|IMAGE|>', '<|AUDIO|>', '<|VIDEO|>']
+    _requires_mm_token_type_ids = False
 
     def init_processor(self, processor) -> None:
         if processor is None:
@@ -677,6 +721,30 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
         self.position_id_per_seconds = default['videos_kwargs']['position_id_per_seconds']
         self.use_audio_in_video = get_env_args('use_audio_in_video', bool, False)
         self.sampling_rate = get_env_args('sampling_rate', int, self.processor.feature_extractor.sampling_rate)
+
+    def _trim_omni_v3_audios(self, audios):
+        """Trim waveforms to hop-length multiple (omni_v3 only). Matches native HF floor framing."""
+        if self.version != 'omni_v3' or not audios:
+            return audios
+        hop = self.processor.feature_extractor.hop_length
+        trimmed = []
+        for audio in audios:
+            if isinstance(audio, tuple):
+                # train: (wav, 'video'); vllm standalone: (wav, sr)
+                trimmed.append((trim_audio_to_hop_length(audio[0], hop), audio[1]))
+            elif isinstance(audio, np.ndarray):
+                trimmed.append(trim_audio_to_hop_length(audio, hop))
+            else:
+                raise TypeError(f'unexpected audio type {type(audio)!r}; expected ndarray or (ndarray, meta)')
+        return trimmed
+
+    def _encode_truncated(self, inputs: StdTemplateInputs):
+        encoded = super()._encode_truncated(inputs)
+        if self.mode == 'vllm' and inputs.audios:
+            inputs.audios = self._trim_omni_v3_audios(inputs.audios)
+            if 'audios' in encoded:
+                encoded['audios'] = inputs.audios
+        return encoded
 
     def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
                     inputs: StdTemplateInputs) -> List[Context]:
@@ -712,15 +780,13 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
                 _video = _video.to(torch.uint8)
             inputs.videos[index] = _video
             if self.use_audio_in_video:
-                import librosa
-                if video.startswith('http://') or video.startswith('https://'):
-                    import audioread
-                    video = audioread.ffdec.FFmpegAudioFile(video)
-                video = librosa.load(video, sr=sampling_rate)[0]
+                if isinstance(video, list):  # image list
+                    raise ValueError('image list as video input does not support use_audio_in_video')
+                audio = load_audio(video, sampling_rate)
                 if self.mode != 'vllm':
-                    inputs.audios.insert(inputs.audio_idx, (video, 'video'))
+                    inputs.audios.insert(inputs.audio_idx, (audio, 'video'))
                 else:
-                    inputs.audios.insert(inputs.audio_idx, video)
+                    inputs.audios.insert(inputs.audio_idx, audio)
                     inputs.mm_processor_kwargs['use_audio_in_video'] = True
                 inputs.audio_idx += 1
                 if self.version == 'omni_v2_5':
@@ -787,6 +853,7 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = Template._encode(self, inputs)
+        inputs.audios = self._trim_omni_v3_audios(inputs.audios)
         processor = self.processor
         video_audios_mask = []
         for i, audio in enumerate(inputs.audios):
@@ -908,6 +975,9 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
 
         return {'inputs_embeds': inputs_embeds}
 
+    def _get_get_rope_index(self):
+        return self._get_model().thinker.get_rope_index
+
     def _get_position_ids(self, inputs: Dict[str, Any]):
         if not self.is_training:
             return {}
@@ -923,7 +993,7 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
             attention_mask = inputs.get('attention_mask')
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
-        position_ids, _ = self._get_model().thinker.get_rope_index(
+        position_ids, _ = self._get_get_rope_index()(
             input_ids,
             inputs.get('image_grid_thw'),
             inputs.get('video_grid_thw'),
@@ -1070,6 +1140,221 @@ register_template(
         prefix=['<|im_start|>system\n{{SYSTEM}}<|im_end|>\n']))
 
 
+class Qwen3TTSTemplate(Template):
+    # ref: https://github.com/QwenLM/Qwen3-TTS/tree/main/finetuning
+    support_padding_free = False
+    use_model = True
+    model_accepts_loss_kwargs = False
+
+    def init_env_args(self) -> None:
+        super().init_env_args()
+        self._config_initialized = False
+        self.target_speaker_embedding = None
+        # Cache TTS config values for data collation
+        config = self.config
+        self._tts_pad_token_id = config.tts_pad_token_id
+        self._tts_bos_token_id = config.tts_bos_token_id
+        self._tts_eos_token_id = config.tts_eos_token_id
+        talker_config = config.talker_config
+        self._codec_nothink_id = talker_config.codec_nothink_id
+        self._codec_think_bos_id = talker_config.codec_think_bos_id
+        self._codec_think_eos_id = talker_config.codec_think_eos_id
+        self._codec_pad_id = talker_config.codec_pad_id
+        self._codec_bos_id = talker_config.codec_bos_id
+        self._codec_eos_token_id = talker_config.codec_eos_token_id
+
+    @staticmethod
+    def _extract_ref_mel(ref_audio_path: str) -> torch.Tensor:
+        """Extract mel spectrogram from reference audio for speaker embedding."""
+        import librosa
+        from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
+        audio, sr = librosa.load(ref_audio_path, sr=None, mono=True)
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=-1)
+        if sr != 24000:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=24000)
+        mels = mel_spectrogram(
+            torch.from_numpy(audio.astype(np.float32)).unsqueeze(0),
+            n_fft=1024,
+            num_mels=128,
+            sampling_rate=24000,
+            hop_size=256,
+            win_size=1024,
+            fmin=0,
+            fmax=12000).transpose(1, 2)  # [1, mel_len, 128]
+        return mels
+
+    def _preprocess_inputs(self, inputs: StdTemplateInputs) -> None:
+        """Override to skip _add_default_tags since audios here are targets, not inputs."""
+        pass
+
+    def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
+        # Get text from messages (assistant content)
+        text = inputs.messages[-1]['content'] if inputs.messages else ''
+
+        # Build TTS text with assistant markers
+        tts_text = f'<|im_start|>assistant\n{text}'
+        text_ids = self._tokenize(tts_text)
+
+        # Get audio codes (pre-extracted or online)
+        audio_codes = inputs.extra_kwargs.get('audio_codes')
+        if audio_codes is None:
+            audio_path = inputs.audios[0] if inputs.audios else None
+            if audio_path:
+                tts_tokenizer = self.processor.tts_tokenizer
+                enc_res = tts_tokenizer.encode([audio_path])
+                audio_codes = enc_res.audio_codes[0].cpu().tolist()
+        assert audio_codes is not None, "Either 'audio_codes' or 'audio'/'audios' must be provided in the dataset."
+        audio_codes = torch.tensor(audio_codes, dtype=torch.long)  # [t, 16]
+
+        # Extract mel spectrogram from reference audio
+        ref_audios = inputs.extra_kwargs.get('ref_audios')
+        ref_audio_path = ref_audios[0]
+        assert ref_audio_path is not None, "'ref_audios' must be provided in the dataset."
+        ref_mel = self._extract_ref_mel(ref_audio_path)  # [1, mel_len, 128]
+
+        return {
+            'input_ids': text_ids,  # dummy for length tracking
+            'labels': None,
+            'tts_audio_codes': audio_codes,  # [codec_len, 16]
+            'tts_ref_mel': ref_mel,  # [1, mel_len, 128]
+        }
+
+    def compute_sft_loss(self, model, inputs, num_items_in_batch=None, trainer=None):
+        """Override to bypass standard label adjustment - TTS loss is computed in forward.
+
+        Combines the talker codec_0 cross-entropy loss with the sub-talker loss
+        using a fixed weighting factor of 0.3.
+        """
+        # Extract speaker_embedding from ref_mels and cache for checkpoint post-processing
+        if 'ref_mels' in inputs:
+            base_model = model.module if hasattr(model, 'module') else model
+            with torch.no_grad():
+                speaker_embedding = base_model.speaker_encoder(inputs['ref_mels'].to(base_model.device).to(
+                    base_model.dtype)).detach()
+            if self.target_speaker_embedding is None:
+                self.target_speaker_embedding = speaker_embedding.cpu()
+            inputs.pop('ref_mels')
+            inputs['speaker_embedding'] = speaker_embedding
+        outputs = model(**inputs)
+        talker_loss = outputs.loss
+        sub_talker_loss = getattr(outputs, 'sub_talker_loss', None)
+        if sub_talker_loss is not None:
+            outputs.loss = talker_loss + 0.3 * sub_talker_loss
+        return outputs
+
+    def save_callback(self, model, output_dir):
+        """Custom save: drop speaker_encoder weights and inject target_speaker_embedding
+        into codec_embedding.weight[3000]."""
+        shutil.copytree(model.config.name_or_path, output_dir, dirs_exist_ok=True)
+        with open(os.path.join(model.config.name_or_path, 'config.json'), 'r', encoding='utf-8') as f:
+            config_dict = json.load(f)
+        speaker_name = get_env_args('speaker_name', str, 'speaker_test')
+        config_dict['tts_model_type'] = 'custom_voice'
+        config_dict['talker_config']['spk_id'] = {speaker_name: 3000}
+        config_dict['talker_config']['spk_is_dialect'] = {speaker_name: False}
+        from safetensors.torch import save_file
+        from transformers.modeling_utils import unwrap_model
+
+        base_model = unwrap_model(model)
+        state_dict = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
+
+        # 1. Drop speaker_encoder keys
+        keys_to_drop = [k for k in state_dict if k.startswith('speaker_encoder')]
+        for k in keys_to_drop:
+            del state_dict[k]
+
+        # 2. Inject target_speaker_embedding into codec_embedding.weight[3000]
+        emb_key = 'talker.model.codec_embedding.weight'
+        if self.target_speaker_embedding is not None and emb_key in state_dict:
+            weight = state_dict[emb_key]
+            state_dict[emb_key][3000] = self.target_speaker_embedding[0].to(weight.dtype)
+
+        save_file(state_dict, os.path.join(output_dir, 'model.safetensors'))
+        # Save config
+        with open(os.path.join(output_dir, 'config.json'), 'w', encoding='utf-8') as f:
+            json.dump(config_dict, f, indent=2, ensure_ascii=False)
+
+    def data_collator(self, batch: List[Dict[str, Any]], *, padding_to=None) -> Dict[str, Any]:
+        """Custom TTS data collation - builds dual-channel input format."""
+        item_length = [len(b['input_ids']) + b['tts_audio_codes'].shape[0] for b in batch]
+        max_length = max(item_length) + 8
+        b_size, t = len(batch), max_length
+
+        input_ids = torch.zeros((b_size, t, 2), dtype=torch.long)
+        codec_ids = torch.zeros((b_size, t, 16), dtype=torch.long)
+        text_embedding_mask = torch.zeros((b_size, t), dtype=torch.bool)
+        codec_embedding_mask = torch.zeros((b_size, t), dtype=torch.bool)
+        codec_mask = torch.zeros((b_size, t), dtype=torch.bool)
+        attention_mask = torch.zeros((b_size, t), dtype=torch.long)
+        codec_0_labels = torch.full((b_size, t), -100, dtype=torch.long)
+
+        for i, data in enumerate(batch):
+            text_ids = torch.tensor(data['input_ids'])  # [text_len]
+            audio_codes = data['tts_audio_codes']  # [codec_len, 16]
+            audio_codec_0 = audio_codes[:, 0]
+
+            text_ids_len = len(text_ids)
+            codec_ids_len = audio_codec_0.shape[0]
+
+            # === Text channel ===
+            input_ids[i, :3, 0] = text_ids[:3]
+            input_ids[i, 3:7, 0] = self._tts_pad_token_id
+            input_ids[i, 7, 0] = self._tts_bos_token_id
+            input_ids[i, 8:8 + text_ids_len - 3, 0] = text_ids[3:]
+            input_ids[i, 8 + text_ids_len - 3, 0] = self._tts_eos_token_id
+            input_ids[i, 8 + text_ids_len - 2:8 + text_ids_len + codec_ids_len, 0] = self._tts_pad_token_id
+            text_embedding_mask[i, :8 + text_ids_len + codec_ids_len] = True
+
+            # === Codec channel ===
+            input_ids[i, 3:8, 1] = torch.tensor([
+                self._codec_nothink_id,
+                self._codec_think_bos_id,
+                self._codec_think_eos_id,
+                0,  # placeholder for speaker embedding
+                self._codec_pad_id,
+            ])
+            input_ids[i, 8:8 + text_ids_len - 3, 1] = self._codec_pad_id
+            input_ids[i, 8 + text_ids_len - 3, 1] = self._codec_pad_id
+            input_ids[i, 8 + text_ids_len - 2, 1] = self._codec_bos_id
+            input_ids[i, 8 + text_ids_len - 1:8 + text_ids_len - 1 + codec_ids_len, 1] = audio_codec_0
+            input_ids[i, 8 + text_ids_len - 1 + codec_ids_len, 1] = self._codec_eos_token_id
+
+            # === Labels (codec layer 0) ===
+            codec_0_labels[i, 8 + text_ids_len - 1:8 + text_ids_len - 1 + codec_ids_len] = audio_codec_0
+            codec_0_labels[i, 8 + text_ids_len - 1 + codec_ids_len] = self._codec_eos_token_id
+
+            # === Sub-talker codec IDs ===
+            codec_ids[i, 8 + text_ids_len - 1:8 + text_ids_len - 1 + codec_ids_len, :] = audio_codes
+
+            # === Masks ===
+            codec_embedding_mask[i, 3:8 + text_ids_len + codec_ids_len] = True
+            codec_embedding_mask[i, 6] = False  # speaker embedding position
+            codec_mask[i, 8 + text_ids_len - 1:8 + text_ids_len - 1 + codec_ids_len] = True
+            attention_mask[i, :8 + text_ids_len + codec_ids_len] = True
+
+        ref_mels = torch.cat([data['tts_ref_mel'] for data in batch], dim=0)
+
+        return {
+            'input_ids': input_ids,
+            'ref_mels': ref_mels,
+            'attention_mask': attention_mask,
+            'text_embedding_mask': text_embedding_mask.unsqueeze(-1),
+            'codec_embedding_mask': codec_embedding_mask.unsqueeze(-1),
+            'labels': codec_0_labels,
+            'codec_0_labels': codec_0_labels,
+            'codec_ids': codec_ids,
+            'codec_mask': codec_mask,
+        }
+
+
+register_template(QwenTemplateMeta(
+    MLLMTemplateType.qwen3_tts,
+    template_cls=Qwen3TTSTemplate,
+    default_system=None,
+))
+
+
 class Ovis1_6Template(Template):
     skip_prompt = False
     use_model = True
@@ -1149,6 +1434,7 @@ register_template(
         MLLMTemplateType.ovis1_6_llama3,
         default_system='You are a helpful and honest multimodal assistant.',
         template_cls=Ovis1_6Template,
+        agent_template=None,
     ))
 
 

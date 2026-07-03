@@ -29,6 +29,8 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.model_accepts_loss_kwargs = True  # fix transformers>=4.46.2
+        if self.template.model_accepts_loss_kwargs is not None:
+            self.model_accepts_loss_kwargs = self.template.model_accepts_loss_kwargs
         if self.args.predict_with_generate:
             self.infer_engine = TransformersEngine(
                 self.model, template=self.template, max_batch_size=self.args.per_device_eval_batch_size)
@@ -136,7 +138,7 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
                 logger.warning_once('The cross_entropy loss function defined in Liger Kernel will not '
                                     'take effect, potentially leading to increased GPU memory consumption.')
             labels = inputs.pop('labels')
-        outputs = model(**inputs)
+        outputs = self.template.compute_sft_loss(model, inputs, num_items_in_batch=num_items_in_batch, trainer=self)
         mode = 'train' if self.model.training else 'eval'
         if getattr(outputs, 'aux_loss', None) is not None:
             self.custom_metrics[mode]['aux_loss'].update(outputs.aux_loss)
@@ -147,11 +149,6 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
 
         if labels is None:
             labels = inputs['labels']
-            outputs.loss = outputs.loss.to(labels.device)
-            # fix https://github.com/huggingface/transformers/issues/34263
-            if num_items_in_batch is not None:
-                outputs.loss = outputs.loss * ((labels[:, 1:] != -100).sum() / num_items_in_batch)
-
             if isinstance(outputs, dict) and 'loss' not in outputs:
                 raise ValueError(
                     'The model did not return a loss from the inputs, only the following keys: '

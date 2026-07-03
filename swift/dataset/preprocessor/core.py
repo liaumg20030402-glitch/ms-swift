@@ -34,6 +34,9 @@ class RowPreprocessor:
                                 'margin',
                                 'teacher_prompt',
                                 'chat_template_kwargs',
+                                # Qwen3-TTS
+                                'ref_audios',
+                                'audio_codes',
                             ]
 
     def __init__(self,
@@ -111,7 +114,7 @@ class RowPreprocessor:
                 raise ValueError(f'rejected_response: {rejected_response}')
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        raise NotImplementedError
+        return row
 
     def prepare_dataset(self, dataset: DATASET_TYPE) -> DATASET_TYPE:
         return dataset
@@ -347,20 +350,17 @@ class RowPreprocessor:
 
         ignore_max_length_error = True
         with self._patch_arrow_writer(), safe_ddp_context(None, True):
-            try:
-                if isinstance(dataset, HfDataset) and not dataset.cache_files:
-                    map_kwargs['cache_file_name'] = os.path.join(get_cache_dir(), 'datasets', 'map_cache',
-                                                                 f'{dataset._fingerprint}.arrow')
-                dataset_mapped = dataset.map(
-                    self.batched_preprocess,
-                    fn_kwargs={
-                        'strict': strict,
-                        'ignore_max_length_error': ignore_max_length_error,
-                    },
-                    remove_columns=list(dataset.features.keys()),
-                    **map_kwargs)
-            except NotImplementedError:
-                pass
+            if isinstance(dataset, HfDataset) and not dataset.cache_files:
+                map_kwargs['cache_file_name'] = os.path.join(get_cache_dir(), 'datasets', 'map_cache',
+                                                             f'{dataset._fingerprint}.arrow')
+            dataset_mapped = dataset.map(
+                self.batched_preprocess,
+                fn_kwargs={
+                    'strict': strict,
+                    'ignore_max_length_error': ignore_max_length_error,
+                },
+                remove_columns=list(dataset.features.keys()),
+                **map_kwargs)
         if isinstance(dataset_mapped, HfDataset) and len(dataset) != len(dataset_mapped):
             logger.info(
                 f'Dataset filtered, origin length: {len(dataset)}, filtered dataset length: {len(dataset_mapped)}')
@@ -516,8 +516,8 @@ class MessagesPreprocessor(RowPreprocessor):
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if 'rejected_messages' in row:
-            row['rejected_messages'] = MessagesPreprocessor.preprocess(
-                self, {'messages': row['rejected_messages']})['messages']
+            rejected = MessagesPreprocessor.preprocess(self, {'messages': row['rejected_messages']})
+            row['rejected_messages'] = rejected['messages'] if rejected else None
         messages = row['messages']
         if self.inner_key is not None:
             messages = messages[self.inner_key]
