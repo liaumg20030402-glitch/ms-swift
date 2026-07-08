@@ -1,14 +1,14 @@
-source /home3/medcog/jycai6/.bashrc
-conda activate swift_sft_py312
+#!/usr/bin/env bash
 
+source /home3/medcog/jycai6/.bashrc
+conda activate swift_sft_397b
+export HOME=/home3/medcog/jycai6
 tmp_cache=/tmp/jycai6_swift_cache_$(hostname)_${RANK:-0}
 export MODELSCOPE_CACHE=$tmp_cache/modelscope
 export HF_HOME=$tmp_cache/huggingface
-# export MEGATRON_LM_PATH=/b3-mix03/aiexam/permanent/kxwu4/swift_rlhf/Megatron-LM-r0.15/Megatron-LM
-# export TRITON_CACHE_DIR=$tmp_cache/triton_cache
-# export PYTHONPATH=/b3-mix03/aiexam/permanent/kxwu4/miniforge3/envs/swift-3.11-gpu/lib/python3.10/site-packages:$PYTHONPATH
-
+export TRITON_CACHE_DIR=$tmp_cache/triton_cache
 PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True'
+
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
@@ -21,8 +21,6 @@ export MASTER_PORT=$MASTER_PORT
 export GLOO_SOCKET_IFNAME=eno1
 export NCCL_SOCKET_IFNAME=eno1
 
-
-
 # single node
 # export RANK=0
 # export NODE_RANK=$RANK
@@ -30,7 +28,6 @@ export NCCL_SOCKET_IFNAME=eno1
 # export NNODES=$WORLD_SIZE
 # export MASTER_PORT=6223
 # export MASTER_ADDR=localhost
-
 # export GLOO_SOCKET_IFNAME=eth0
 # export NCCL_SOCKET_IFNAME=eth0
 
@@ -43,38 +40,59 @@ export CUDA_LAUNCH_BLOCKING=0
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 MODEL_PATH=/train21/medcog/permanent/leijiang19/pretrain_models/Qwen3.5-27B
-# MODEL_PATH=/train21/medcog/permanent/leijiang19/pretrain_models/Qwen3.5-35B-A3B
 
-# ============ 训练数据 ============
-DATASETS=("/train21/medcog/permanent/jycai6/sft_data_zlzl/data/20260522/2_merged/z1z1_20260522.jsonl")
+# 修改为实际的纯文本预训练数据路径
+# 格式：{messages: [{role: "assistant", content: 预训练文本}]}
+# {"messages": [{"role": "assistant", "content": "<image>是一只小狗，<image>是一只小猫"}], "images": ["/xxx/x.jpg", "/xxx/x.png"]}
+DATASET_ROOT=/V14/synthetic-pt
 
-output_dir=/train21/medcog/permanent/jycai6/med_sft_train_swift/exps/qwen_27b_sft_med_1043_20260501/model_output/qwen_27b_sft_med_1043_32k_20260502_epoch_v2
+mapfile -d '' DATASETS < <(
+    find "$DATASET_ROOT" -type f -name '*.jsonl' -print0 | sort -z
+)
 
-megatron sft \
-    --dataset $DATASETS \
-    --split_dataset_ratio=0 \
+if [ ${#DATASETS[@]} -eq 0 ]; then
+    echo "No JSONL files found under $DATASET_ROOT"
+    exit 1
+fi
+
+echo "Found ${#DATASETS[@]} JSONL files"
+
+output_dir=/train21/medcog/permanent/jycai6/jmlli27/pt/exps/qwen3_5_27b_cpt_32k
+
+# world size = TP4 * PP1 * CP2 * DP6
+megatron pt \
+    --dataset "${DATASETS[@]}" \
+    --split_dataset_ratio 0 \
     --model $MODEL_PATH \
+    --output_dir $output_dir \
     --save_safetensors true \
     --load_from_cache_file true \
+    --streaming true \
+    --dataset_shuffle true \
+    --shuffle_buffer_size 10000 \
     --logging_steps 1 \
-    --add_non_thinking_prefix true \
+    --tuner_type full \
+    --finetune true \
+    --torch_dtype bfloat16 \
     --tensor_model_parallel_size 4 \
+    --pipeline_model_parallel_size 1 \
+    --context_parallel_size 1 \
     --micro_batch_size 1 \
-    --global_batch_size 64 \
+    --global_batch_size 96 \
     --freeze_llm false \
     --freeze_vit true \
     --freeze_aligner true \
     --packing true \
-    --num_train_epochs 3 \
-    --finetune true \
-    --cross_entropy_loss_fusion true \
-    --lr 5e-6 \
-    --lr_warmup_fraction 0.05 \
-    --min_lr 5e-7 \
-    --loss_scale ignore_empty_think \
     --padding_free true \
-    --output_dir $output_dir \
-    --max_length 32768 \
+    --truncation_strategy split \
+    --num_train_epochs 1 \
+    --train_iters 120000 \
+    --cross_entropy_loss_fusion true \
+    --apply_wd_to_qk_layernorm true \
+    --lr 1e-5 \
+    --lr_warmup_fraction 0.05 \
+    --min_lr 1e-6 \
+    --max_length 8192 \
     --dataloader_num_workers 8 \
     --dataset_num_proc 196 \
     --no_save_optim false \
@@ -85,4 +103,4 @@ megatron sft \
     --recompute_granularity full \
     --recompute_method uniform \
     --recompute_num_layers 1 \
-    --save_strategy epoch
+    --save_steps 20000 

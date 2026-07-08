@@ -4,6 +4,20 @@
 1. 将 checkpoint 目录复制到同级目录下的新目录（名称为 `[原目录名]-resave`）
    - 排除 iter_ 开头的子目录（optimizer 等参数状态）
 2. 将预训练模型目录中的 `.jinja` 和 `.json` 文件复制到新目录（排除 `model.safetensors.index.json`）
+
+① 复制 checkpoint,但剔除 iter_* 子目录(脚本 57-66 行)
+训练 ckpt 里除了模型权重(safetensors),还有 iter_xxx/ 目录,装的是 optimizer / RNG / 分布式优化器状态(mcore/torch_dist 格式,巨大,推理用不上);
+resave 时跳过所有 iter_ 开头的内容,只留权重 → 目录瘦身、干净。
+② 从原始预训练模型补回配置/分词器文件(82-99 行)
+把 pretrained 目录里的 .jinja + .json 文件(tokenizer_config.json、generation_config.json、chat_template.jinja、special_tokens_map.json 等)拷进新目录;
+唯独排除 model.safetensors.index.json —— 因为 checkpoint 已经有自己那份 index(指向训练后的权重分片),用预训练的 index 会把权重映射搞乱。
+结果:checkpoint-XXX-resave = 训练后的权重 + 完整的 tokenizer/config/chat 模板,一个自包含、能被 vLLM/SGLang/transformers 直接加载的模型目录。
+为什么需要它
+训练 ckpt 往往两头都不全:
+
+多了优化器状态(iter_*,几 TB,推理无用);
+少了推理引擎要的 tokenizer/生成配置/对话模板(训练时不一定全存)。
+resave 把"多的删掉、缺的补上",一步到位变成可推理模型。这就是你 infer_sglang.sh 里直接指向 -resave 目录的原因。
 """
 
 import os

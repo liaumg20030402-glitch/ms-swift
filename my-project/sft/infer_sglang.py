@@ -1,6 +1,6 @@
 """
 使用 SGLang Engine 对 Qwen3.5-27B 模型进行批量推理
-输入：JSONL 文件，每行包含 messages 和可选的 images 字段
+输入：JSONL 文件，每行包含 messages 和可选的 images 字段，{"messages":[{"role":"user","content":"<image><image>两张图片有什么区别"}], "images":["x.jpg","x.png"]}
 输出：JSONL 文件，每行追加 response 字段
 """
 
