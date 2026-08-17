@@ -60,7 +60,7 @@ pip install pybind11
 pip install --no-build-isolation "transformer_engine[pytorch]"
 # pip install "megatron-core==0.15.*" -U
 pip install \
-    "mcore-bridge==1.5.0" \（mtp好像要1.5.2）
+    "mcore-bridge==1.5.0" \（mtp要1.5.2）
     "megatron-core==0.17.1"
 
 pip install tilelang
