@@ -108,11 +108,11 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1 # NCCL 出错时异步抛错，避免�
 ## 四、并行策略（397B 的核心，相比 27B 新增 PP + 专家并行）
 
 > 整除关系（任一不满足都会启动即报错）：
-> 1. `world_size = TP × PP × DP`（DP 自动推导）
+> 1. `world_size = TP × PP × CP x DP`（DP 自动推导）
 > 2. ETP=1 时 `EP` 必须整除 `TP × DP`
-> 3. `PP` 必须整除模型层数（397B=60 层，122B=48 层）
+> 3. `PP` 必须整除模型层数（397B=60 层，122B=48 层，27B=64层）
 > 4. `EP` 必须整除专家总数（**397B=512，122B=256**）
-> 5. `TP` 必须整除 `num_query_groups`（**397B/122B 实测=2 ⇒ TP 只能取 2**）
+> 5. `TP` 必须整除 `num_query_groups`（**397B/122B 实测=2 ⇒ TP 只能取 2**，新环境可以取4，解除了限制）
 
 ### `--tensor_model_parallel_size 2`（TP）
 **张量并行**：把单层的权重矩阵切到 2 张卡上并行做矩阵乘。通信最重（每层 all-reduce），**只放节点内走 NVLink**。这里被 `num_query_groups=2` 限制，TP 最大只能 2。
